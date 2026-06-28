@@ -70,6 +70,8 @@ export class SocketTerminal implements Terminal {
 	 */
 	#pendingInput: string[] = [];
 	#pendingInputBytes = 0;
+	#writeQueue: string[] = [];
+	#waitingForDrain = false;
 	#cwd?: string;
 	#resolveCwd?: (cwd: string | undefined) => void;
 	#cwdPromise: Promise<string | undefined>;
@@ -180,12 +182,33 @@ export class SocketTerminal implements Terminal {
 	async drainInput(): Promise<void> {}
 
 	write(data: string): void {
-		// `writable`, not `!destroyed`: after the peer half-closes (FIN — e.g. a
-		// liveness probe that connects and immediately ends) there is a window
-		// where the socket is not yet destroyed but writing throws writeAfterFIN
-		// ("socket has been ended by the other party") — an uncaught exception
-		// that kills the whole shared daemon.
-		if (this.#socket.writable) this.#socket.write(data);
+		if (!this.#socket.writable) return;
+		if (this.#waitingForDrain || this.#writeQueue.length) {
+			this.#writeQueue.push(data);
+			return;
+		}
+		if (this.#socket.write(data) === false) {
+			// socket.write() returned false - the data is buffered internally.
+			// Set flag to queue subsequent writes; we'll resume on 'drain'.
+			this.#waitingForDrain = true;
+			this.#socket.once("drain", () => this.#resumeWrites());
+		}
+	}
+
+	#resumeWrites(): void {
+		this.#waitingForDrain = false;
+		while (this.#writeQueue.length) {
+			if (!this.#socket.writable) {
+				// Socket became unwritable; drop remaining queued writes.
+				this.#writeQueue.length = 0;
+				return;
+			}
+			if (this.#socket.write(this.#writeQueue.shift()!) === false) {
+				this.#waitingForDrain = true;
+				this.#socket.once("drain", () => this.#resumeWrites());
+				return;
+			}
+		}
 	}
 
 	get columns(): number {

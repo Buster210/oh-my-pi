@@ -180,3 +180,91 @@ test("live input dispatches inside the provided scope runner", async () => {
 	expect(seen).toEqual(["session-scope"]);
 	client.destroy();
 });
+
+test("write backpressure queues data and flushes on drain event", async () => {
+	const writes: string[] = [];
+	let drainEmitted = false;
+	const events: Record<string, (() => void)[]> = {};
+	const mockSocket = {
+		writable: true,
+		write: (data: string | Buffer): boolean => {
+			writes.push(data.toString());
+			return drainEmitted;
+		},
+		once: (event: string, cb: () => void) => {
+			if (!events[event]) events[event] = [];
+			(events[event] as any[]).push(cb);
+		},
+		on: (event: string, cb: () => void) => {
+			if (!events[event]) events[event] = [];
+			(events[event] as any[]).push(cb);
+		},
+		destroy: () => {
+			mockSocket.writable = false;
+		},
+	} as unknown as net.Socket;
+
+	const terminal = new SocketTerminal(mockSocket as net.Socket, 80, 24);
+
+	// First write returns false - should set waiting flag and wait for drain
+	terminal.write("first");
+	expect(writes).toEqual(["first"]);
+	expect(events["drain"]).toBeDefined();
+
+	// Second write while waiting - should queue without attempting write
+	terminal.write("second");
+	expect(writes).toEqual(["first"]); // No new write yet
+
+	// Third write - also queued
+	terminal.write("third");
+	expect(writes).toEqual(["first"]); // Still no new write
+
+	// Emit drain - should flush queue in order
+	drainEmitted = true;
+	const drainCb = events["drain"]![0];
+	drainCb();
+	await Bun.sleep(10);
+
+	expect(writes).toEqual(["first", "second", "third"]);
+});
+
+test("write backpressure clears queue when socket becomes unwritable", async () => {
+	const writes: string[] = [];
+	const events: Record<string, (() => void)[]> = {};
+	const mockSocket = {
+		writable: true,
+		write: (data: string | Buffer): boolean => {
+			writes.push(data.toString());
+			return false; // Always backpressure
+		},
+		once: (event: string, cb: () => void) => {
+			if (!events[event]) events[event] = [];
+			(events[event] as any[]).push(cb);
+		},
+		on: (event: string, cb: () => void) => {
+			if (!events[event]) events[event] = [];
+			(events[event] as any[]).push(cb);
+		},
+		destroy: () => {
+			mockSocket.writable = false;
+		},
+	} as unknown as net.Socket;
+
+	const terminal = new SocketTerminal(mockSocket as net.Socket, 80, 24);
+
+	// Queue multiple writes
+	terminal.write("one");
+	terminal.write("two");
+	terminal.write("three");
+	expect(writes).toEqual(["one"]); // Only first write happened, others queued
+
+	// Socket becomes unwritable before drain fires
+	mockSocket.writable = false;
+
+	// Emit drain - should clear queue without error
+	events["drain"]![0]();
+	await Bun.sleep(10);
+
+	// No more writes after socket became unwritable
+	expect(writes).toEqual(["one"]);
+});

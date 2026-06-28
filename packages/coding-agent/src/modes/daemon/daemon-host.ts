@@ -85,6 +85,7 @@ export function newSessionScope(settings: Settings | undefined): SessionScope {
 		autoLightTheme: "light",
 		autoDetectedTheme: false,
 		terminalReportedAppearance: undefined,
+		themeLoadRequestId: 0,
 		hostUriHandlers: new Map(),
 	};
 }

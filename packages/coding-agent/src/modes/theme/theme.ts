@@ -2284,8 +2284,14 @@ export interface ThemeChangeEvent {
 	ephemeral?: boolean;
 }
 const onThemeChangeCallbacks = new Map<(event: ThemeChangeEvent) => void, ReturnType<typeof getSessionScope>>();
-var themeLoadRequestId: number = 0;
+const themeLoadRequestIdSlot = scopedSlot("themeLoadRequestId", 0);
 let themeEpoch = 0;
+
+function getAndIncrementThemeLoadRequestId(): number {
+	const current = themeLoadRequestIdSlot.get();
+	themeLoadRequestIdSlot.set(current + 1);
+	return current + 1;
+}
 
 function getCurrentThemeOptions(): CreateThemeOptions {
 	return {
@@ -2328,10 +2334,10 @@ export async function setTheme(
 ): Promise<{ success: boolean; error?: string }> {
 	autoDetectedThemeSlot.set(false);
 	setCurrentThemeNameInternal(name);
-	const requestId = ++themeLoadRequestId;
+	const requestId = getAndIncrementThemeLoadRequestId();
 	try {
 		const loadedTheme = await loadTheme(name, getCurrentThemeOptions());
-		if (requestId !== themeLoadRequestId) {
+		if (requestId !== themeLoadRequestIdSlot.get()) {
 			return { success: false, error: "Theme change superseded by a newer request" };
 		}
 		setGlobalOrScopedTheme(loadedTheme);
@@ -2341,7 +2347,7 @@ export async function setTheme(
 		notifyThemeChange();
 		return { success: true };
 	} catch (error) {
-		if (requestId !== themeLoadRequestId) {
+		if (requestId !== themeLoadRequestIdSlot.get()) {
 			return { success: false, error: "Theme change superseded by a newer request" };
 		}
 		// Theme is invalid - fall back to dark theme
@@ -2363,17 +2369,17 @@ export async function previewTheme(
 	name: string,
 	event: ThemeChangeEvent = { ephemeral: true },
 ): Promise<{ success: boolean; error?: string }> {
-	const requestId = ++themeLoadRequestId;
+	const requestId = getAndIncrementThemeLoadRequestId();
 	try {
 		const loadedTheme = await loadTheme(name, getCurrentThemeOptions());
-		if (requestId !== themeLoadRequestId) {
+		if (requestId !== themeLoadRequestIdSlot.get()) {
 			return { success: false, error: "Theme preview superseded by a newer request" };
 		}
 		setGlobalOrScopedTheme(loadedTheme);
 		notifyThemeChange(event);
 		return { success: true };
 	} catch (error) {
-		if (requestId !== themeLoadRequestId) {
+		if (requestId !== themeLoadRequestIdSlot.get()) {
 			return { success: false, error: "Theme preview superseded by a newer request" };
 		}
 		return {
@@ -2433,16 +2439,16 @@ export async function setSymbolPreset(preset: SymbolPreset): Promise<void> {
 	const themeName = getCurrentThemeNameInternal();
 	if (!themeName) return;
 
-	const requestId = ++themeLoadRequestId;
+	const requestId = getAndIncrementThemeLoadRequestId();
 	try {
 		const loadedTheme = await loadTheme(themeName, getCurrentThemeOptions());
-		if (requestId !== themeLoadRequestId) return;
+		if (requestId !== themeLoadRequestIdSlot.get()) return;
 		setGlobalOrScopedTheme(loadedTheme);
 	} catch {
-		if (requestId !== themeLoadRequestId) return;
+		if (requestId !== themeLoadRequestIdSlot.get()) return;
 		// Fall back to dark theme with new preset
 		setGlobalOrScopedTheme(await loadTheme("dark", getCurrentThemeOptions()));
-		if (requestId !== themeLoadRequestId) return;
+		if (requestId !== themeLoadRequestIdSlot.get()) return;
 	}
 	notifyThemeChange({ ephemeral: true });
 }
@@ -2463,16 +2469,16 @@ export async function setColorBlindMode(enabled: boolean): Promise<void> {
 	const themeName = getCurrentThemeNameInternal();
 	if (!themeName) return;
 
-	const requestId = ++themeLoadRequestId;
+	const requestId = getAndIncrementThemeLoadRequestId();
 	try {
 		const loadedTheme = await loadTheme(themeName, getCurrentThemeOptions());
-		if (requestId !== themeLoadRequestId) return;
+		if (requestId !== themeLoadRequestIdSlot.get()) return;
 		setGlobalOrScopedTheme(loadedTheme);
 	} catch {
-		if (requestId !== themeLoadRequestId) return;
+		if (requestId !== themeLoadRequestIdSlot.get()) return;
 		// Fall back to dark theme
 		setGlobalOrScopedTheme(await loadTheme("dark", getCurrentThemeOptions()));
-		if (requestId !== themeLoadRequestId) return;
+		if (requestId !== themeLoadRequestIdSlot.get()) return;
 	}
 	notifyThemeChange({ ephemeral: true });
 }

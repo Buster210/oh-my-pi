@@ -35,6 +35,7 @@ function makeScope(sink: (data: string) => void): SessionScope {
 		autoLightTheme: "light",
 		autoDetectedTheme: false,
 		terminalReportedAppearance: undefined,
+		themeLoadRequestId: 0,
 		hostUriHandlers: new Map(),
 		terminalOut: sink,
 	};

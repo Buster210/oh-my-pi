@@ -187,6 +187,8 @@
 
 - Fixed daemon host exiting on runtime server errors (e.g. EMFILE under fd churn) by distinguishing listen-phase failures (still fatal) from post-listen errors (logged, survive).
 - Fixed server error handler to log and survive runtime errors after the server is listening, preventing shared-host teardown that would kill all concurrent sessions.
+- Fixed socket write ignoring backpressure, which could cause unbounded memory growth on slow/stalled clients affecting all sessions on the shared daemon host.
+- Fixed `disconnectAll()` not clearing deferred lazy-connect state (`#deferredConfigs`, `#deferredSnapshots`, `#lazyConnectTriggered`), causing stale instructions to persist and preventing re-deferral on subsequent lazy connects.
 
 ## [16.3.5] - 2026-07-04
 

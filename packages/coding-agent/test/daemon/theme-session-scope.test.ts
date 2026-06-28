@@ -19,6 +19,7 @@ import {
 	getThemeByName,
 	setAutoThemeMapping,
 	setThemeInstance,
+	setTheme,
 	theme,
 } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -46,6 +47,7 @@ function makeScope(sessionId: string): SessionScope {
 		autoLightTheme: "light",
 		autoDetectedTheme: false,
 		terminalReportedAppearance: undefined,
+		themeLoadRequestId: 0,
 		hostUriHandlers: new Map(),
 	};
 }
@@ -108,5 +110,47 @@ describe("theme session scope isolation", () => {
 		runWithSessionScope(scopeA, () => setActiveRules(rulesA));
 		expect(runWithSessionScope(scopeA, () => getActiveRules())).toBe(rulesA);
 		expect(runWithSessionScope(scopeB, () => getActiveRules())).not.toBe(rulesA);
+	});
+
+	// BLOCKER #8: themeLoadRequestId used to be a module-global that would get
+	// clobbered by concurrent sessions. Session A's theme load could be wrongly
+	// discarded as "superseded" when session B triggered another theme load.
+	// This test proves the request counter is session-scoped by verifying that
+	// incrementing in one session does not affect another's counter.
+	it("theme load request IDs are isolated per session", async () => {
+		// Test the counter isolation directly - this is the contract that prevents
+		// cross-session cancellation in setTheme/previewTheme/setSymbolPreset/setColorBlindMode.
+		const scopeA = makeScope("A");
+		const scopeB = makeScope("B");
+
+		// Verify both sessions start at 0
+		expect(scopeA.themeLoadRequestId).toBe(0);
+		expect(scopeB.themeLoadRequestId).toBe(0);
+
+		// Increment in scope A - should be 1
+		await runWithSessionScope(scopeA, async () => {
+			const result = await setTheme("dark");
+			expect(result.success).toBe(true);
+		});
+		expect(scopeA.themeLoadRequestId).toBe(1);
+		expect(scopeB.themeLoadRequestId).toBe(0); // B's counter unchanged
+
+		// Increment in scope B - should be 1 (independent from A)
+		await runWithSessionScope(scopeB, async () => {
+			const result = await setTheme("light");
+			expect(result.success).toBe(true);
+		});
+		expect(scopeA.themeLoadRequestId).toBe(1); // A's counter unchanged
+		expect(scopeB.themeLoadRequestId).toBe(1);
+
+		// Both can increment independently
+		await runWithSessionScope(scopeA, async () => {
+			await setTheme("dark");
+		});
+		await runWithSessionScope(scopeB, async () => {
+			await setTheme("light");
+		});
+		expect(scopeA.themeLoadRequestId).toBe(2);
+		expect(scopeB.themeLoadRequestId).toBe(2);
 	});
 });

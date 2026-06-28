@@ -28,42 +28,18 @@ const fileOperationLocks = new Map<string, Promise<void>>();
 const INIT_FAILURE_BACKOFF_MS = 3 * 60 * 1000;
 const initFailures = new Map<string, { at: number; message: string }>();
 
-// Idle timeout configuration (disabled by default)
-let idleTimeoutMs: number | null = null;
-let idleCheckInterval: NodeJS.Timeout | null = null;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 
+// Per-cwd idle timeout — a second session's config can't overwrite another's across the lspmux await.
+const idleTimeoutByCwd = new Map<string, number | null>();
+
 /**
- * Configure the idle timeout for LSP clients.
+ * Configure the idle timeout for LSP clients created under `cwd`.
+ * @param cwd - Working directory the timeout applies to
  * @param ms - Timeout in milliseconds, or null/undefined to disable
  */
-export function setIdleTimeout(ms: number | null | undefined): void {
-	idleTimeoutMs = ms ?? null;
-
-	if (idleTimeoutMs && idleTimeoutMs > 0) {
-		startIdleChecker();
-	} else {
-		stopIdleChecker();
-	}
-}
-
-function startIdleChecker(): void {
-	if (idleCheckInterval) return;
-	idleCheckInterval = setInterval(() => {
-		const now = Date.now();
-		for (const [key, client] of Array.from(clients.entries())) {
-			if (client.idleTimeoutMs && now - client.lastActivity > client.idleTimeoutMs) {
-				void shutdownClient(key);
-			}
-		}
-	}, IDLE_CHECK_INTERVAL_MS);
-}
-
-function stopIdleChecker(): void {
-	if (idleCheckInterval) {
-		clearInterval(idleCheckInterval);
-		idleCheckInterval = null;
-	}
+export function setIdleTimeout(cwd: string, ms: number | null | undefined): void {
+	idleTimeoutByCwd.set(cwd, ms ?? null);
 }
 
 // =============================================================================
@@ -690,18 +666,31 @@ export async function getOrCreateClient(
 			isReading: false,
 			status: "connecting",
 			lastActivity: Date.now(),
-			// Captured at spawn time from the calling session's `setIdleTimeout` — each
-			// client keeps its own session's config instead of a shared module value
-			// that the last caller to configure the daemon would silently overwrite.
-			idleTimeoutMs,
+			// Per-cwd resolution — concurrent sessions can't overwrite each other's timeout.
+			idleTimeoutMs: idleTimeoutByCwd.get(cwd) ?? null,
+			idleCheckInterval: null,
 			writeQueue: Promise.resolve(),
 			activeProgressTokens: new Set(),
 			projectLoaded,
 			resolveProjectLoaded,
 		};
+		const idleTimeout = client.idleTimeoutMs;
+		if (idleTimeout && idleTimeout > 0) {
+			client.idleCheckInterval = setInterval(() => {
+				const now = Date.now();
+				if (clients.has(key) && now - client.lastActivity > idleTimeout) {
+					void shutdownClient(key);
+				}
+			}, IDLE_CHECK_INTERVAL_MS);
+		}
 
 		// Register crash recovery - remove client on process exit
 		proc.exited.then(() => {
+			if (client.idleCheckInterval) {
+				clearInterval(client.idleCheckInterval);
+				client.idleCheckInterval = null;
+			}
+
 			if (clients.get(key) === client) clients.delete(key);
 			if (clientLocks.get(key) === clientPromise) clientLocks.delete(key);
 			client.resolveProjectLoaded();
@@ -1101,6 +1090,11 @@ async function waitForExit(client: LspClient, timeoutMs: number): Promise<boolea
  * Shutdown a specific client instance using the LSP shutdown/exit handshake.
  */
 async function shutdownClientInstance(client: LspClient): Promise<void> {
+	if (client.idleCheckInterval) {
+		clearInterval(client.idleCheckInterval);
+		client.idleCheckInterval = null;
+	}
+
 	const err = new Error("LSP client shutdown");
 	for (const pending of Array.from(client.pendingRequests.values())) {
 		pending.reject(err);

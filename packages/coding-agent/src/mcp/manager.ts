@@ -904,6 +904,9 @@ export class MCPManager {
 		this.#tools = [];
 		this.#subscribedResources.clear();
 		this.#reconnectHistory.clear();
+		this.#deferredConfigs.clear();
+		this.#deferredSnapshots.clear();
+		this.#lazyConnectTriggered = false;
 	}
 
 	/**

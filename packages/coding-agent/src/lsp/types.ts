@@ -408,6 +408,8 @@ export interface LspClient {
 	lastActivity: number;
 	/** Idle timeout for this client's session/cwd config; null/undefined disables idle shutdown. */
 	idleTimeoutMs?: number | null;
+	/** Per-client idle check interval handle; managed independently per client. */
+	idleCheckInterval?: NodeJS.Timeout | null;
 	/** Serializes outbound JSON-RPC writes to the server process. */
 	writeQueue: Promise<void>;
 	/** Tracks active work-done progress tokens from the server */

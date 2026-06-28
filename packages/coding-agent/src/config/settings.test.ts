@@ -44,6 +44,7 @@ function createTestScope(sessionId: string): SessionScope {
 		autoLightTheme: "",
 		autoDetectedTheme: false,
 		terminalReportedAppearance: undefined,
+		themeLoadRequestId: 0,
 		hostUriHandlers: new Map(),
 	} as SessionScope;
 }
