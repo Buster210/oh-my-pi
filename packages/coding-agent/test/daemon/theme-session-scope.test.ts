@@ -17,7 +17,10 @@ import {
 	getAutoThemeMapping,
 	getCurrentThemeName,
 	getThemeByName,
+	getThemeEpoch,
 	setAutoThemeMapping,
+	setColorBlindMode,
+	setSymbolPreset,
 	setTheme,
 	setThemeInstance,
 	theme,
@@ -47,7 +50,9 @@ function makeScope(sessionId: string): SessionScope {
 		autoLightTheme: "light",
 		autoDetectedTheme: false,
 		terminalReportedAppearance: undefined,
+		macOSReportedAppearance: undefined,
 		themeLoadRequestId: 0,
+		themeEpoch: 0,
 		hostUriHandlers: new Map(),
 	};
 }
@@ -123,11 +128,9 @@ describe("theme session scope isolation", () => {
 		const scopeA = makeScope("A");
 		const scopeB = makeScope("B");
 
-		// Verify both sessions start at 0
 		expect(scopeA.themeLoadRequestId).toBe(0);
 		expect(scopeB.themeLoadRequestId).toBe(0);
 
-		// Increment in scope A - should be 1
 		await runWithSessionScope(scopeA, async () => {
 			const result = await setTheme("dark");
 			expect(result.success).toBe(true);
@@ -135,7 +138,6 @@ describe("theme session scope isolation", () => {
 		expect(scopeA.themeLoadRequestId).toBe(1);
 		expect(scopeB.themeLoadRequestId).toBe(0); // B's counter unchanged
 
-		// Increment in scope B - should be 1 (independent from A)
 		await runWithSessionScope(scopeB, async () => {
 			const result = await setTheme("light");
 			expect(result.success).toBe(true);
@@ -143,7 +145,6 @@ describe("theme session scope isolation", () => {
 		expect(scopeA.themeLoadRequestId).toBe(1); // A's counter unchanged
 		expect(scopeB.themeLoadRequestId).toBe(1);
 
-		// Both can increment independently
 		await runWithSessionScope(scopeA, async () => {
 			await setTheme("dark");
 		});
@@ -152,5 +153,28 @@ describe("theme session scope isolation", () => {
 		});
 		expect(scopeA.themeLoadRequestId).toBe(2);
 		expect(scopeB.themeLoadRequestId).toBe(2);
+	});
+
+	// BLOCKER #9: epoch was a module-global; session A's bump corrupted B's memoized renderers.
+	it("theme epoch is isolated per session", async () => {
+		const scopeA = makeScope("A");
+		const scopeB = makeScope("B");
+
+		expect(runWithSessionScope(scopeA, () => getThemeEpoch())).toBe(0);
+		expect(runWithSessionScope(scopeB, () => getThemeEpoch())).toBe(0);
+
+		// Bump epoch in scope A
+		await runWithSessionScope(scopeA, async () => {
+			await setColorBlindMode(true);
+		});
+		expect(runWithSessionScope(scopeA, () => getThemeEpoch())).toBe(1);
+		expect(runWithSessionScope(scopeB, () => getThemeEpoch())).toBe(0); // B's epoch unchanged
+
+		// Bump epoch in scope B - should be independent from A
+		await runWithSessionScope(scopeB, async () => {
+			await setSymbolPreset("nerd");
+		});
+		expect(runWithSessionScope(scopeA, () => getThemeEpoch())).toBe(1); // A's epoch unchanged
+		expect(runWithSessionScope(scopeB, () => getThemeEpoch())).toBe(1);
 	});
 });

@@ -311,7 +311,9 @@ function makeDaemonScope(terminalOut: ((data: string) => void) | undefined): Ses
 		autoLightTheme: "light",
 		autoDetectedTheme: false,
 		terminalReportedAppearance: undefined,
+		macOSReportedAppearance: undefined,
 		themeLoadRequestId: 0,
+		themeEpoch: 0,
 		hostUriHandlers: new Map(),
 		terminalOut,
 	};

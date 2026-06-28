@@ -182,4 +182,33 @@ describe("MCP lazy connection", () => {
 		expect(manager.getConnectedServers()).toHaveLength(0);
 		expect(manager.getServerInstructions().get("removedServer")).toBe("STALE_SENTINEL");
 	});
+
+	it("disconnectServer clears one server's deferred state without resurrecting it", async () => {
+		const cache = memoryToolCache();
+		const config = baseConfig();
+		await cache.set(
+			"removedServer",
+			config,
+			[{ name: "cached_tool", description: "from cache", inputSchema: { type: "object" } }],
+			{
+				instructions: "STALE_SENTINEL",
+			},
+		);
+
+		manager = new MCPManager(workDir, cache);
+		await manager.connectServers({ removedServer: config }, {}, undefined, true);
+
+		// Verify deferred state is populated
+		expect(manager.getServerInstructions().get("removedServer")).toBe("STALE_SENTINEL");
+
+		// disconnectServer should clear this server's deferred state
+		await manager.disconnectServer("removedServer");
+		expect(manager.getServerInstructions().get("removedServer")).toBeUndefined();
+
+		// getTools() must not resurrect the disconnected server from stale deferred state
+		manager.getTools();
+		await Bun.sleep(10);
+		expect(manager.getConnectedServers()).not.toContain("removedServer");
+		expect(manager.getServerInstructions().get("removedServer")).toBeUndefined();
+	});
 });

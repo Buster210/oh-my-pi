@@ -55,7 +55,9 @@ export interface SessionScope {
 	autoLightTheme: string;
 	autoDetectedTheme: boolean;
 	terminalReportedAppearance: "dark" | "light" | undefined;
+	macOSReportedAppearance: "dark" | "light" | undefined;
 	themeLoadRequestId: number;
+	themeEpoch: number;
 	/**
 	 * Raw terminal-escape sink for this session's client (title/clipboard OSC
 	 * sequences). A function field — not a `SocketTerminal` import — keeps this

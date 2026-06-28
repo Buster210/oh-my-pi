@@ -855,6 +855,9 @@ export class MCPManager {
 		this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
 		this.#reconnectHistory.delete(name);
+		// Without these, a deferred server survives disconnectServer via stale #deferredConfigs.
+		this.#deferredConfigs.delete(name);
+		this.#deferredSnapshots.delete(name);
 
 		const connection = this.#connections.get(name);
 

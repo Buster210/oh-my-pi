@@ -2112,8 +2112,7 @@ const terminalReportedAppearanceSlot = scopedSlot(
 	undefined as "dark" | "light" | undefined,
 );
 
-/** Appearance reported by the macOS fallback observer, or undefined if not yet available. */
-var macOSReportedAppearance: "dark" | "light" | undefined;
+const macOSReportedAppearanceSlot = scopedSlot("macOSReportedAppearance", undefined as "dark" | "light" | undefined);
 
 function shouldUseMacOSAppearanceFallback(): boolean {
 	// Zellij currently breaks OSC 11 passthrough on macOS, so terminal-derived
@@ -2140,7 +2139,7 @@ function detectTerminalBackground(): "dark" | "light" {
 
 	// Tier 3: host macOS appearance for known-broken terminal paths only.
 	if (shouldUseMacOSAppearanceFallback()) {
-		const macAppearance = macOSReportedAppearance ?? detectMacOSAppearance();
+		const macAppearance = macOSReportedAppearanceSlot.get() ?? detectMacOSAppearance();
 		if (macAppearance) return macAppearance;
 	}
 
@@ -2285,7 +2284,7 @@ export interface ThemeChangeEvent {
 }
 const onThemeChangeCallbacks = new Map<(event: ThemeChangeEvent) => void, ReturnType<typeof getSessionScope>>();
 const themeLoadRequestIdSlot = scopedSlot("themeLoadRequestId", 0);
-let themeEpoch = 0;
+const themeEpochSlot = scopedSlot("themeEpoch", 0);
 
 function getAndIncrementThemeLoadRequestId(): number {
 	const current = themeLoadRequestIdSlot.get();
@@ -2506,12 +2505,12 @@ export function onThemeChange(callback: (event: ThemeChangeEvent) => void): () =
  * key cached renders on it so the next render re-shapes their output.
  */
 export function getThemeEpoch(): number {
-	return themeEpoch;
+	return themeEpochSlot.get();
 }
 
 /** Bump the theme epoch and notify the registered theme-change listener. */
 function notifyThemeChange(event: ThemeChangeEvent = {}): void {
-	themeEpoch++;
+	themeEpochSlot.set(themeEpochSlot.get() + 1);
 	for (const [callback, scope] of onThemeChangeCallbacks) {
 		if (scope) {
 			runWithSessionScope(scope, () => callback(event));
@@ -2638,17 +2637,36 @@ function reevaluateAutoTheme(debugLabel: string, event: ThemeChangeEvent = {}): 
 // macOS Appearance Fallback Observer
 // ============================================================================
 
+// ponytail: process-level OS callback, can't be made per-session. Only
+// reachable with enableWatcher=true on macOS+Zellij. The observer callback
+// runs outside any scope, so we capture the scope at startup and re-enter
+// it when the callback fires. See the SIGWINCH ponytail above for context.
 var macObserver: { stop(): void } | undefined;
+var macOSScope: ReturnType<typeof getSessionScope> | undefined;
 
 function startMacAppearanceObserver(): void {
 	stopMacAppearanceObserver();
 	if (!shouldUseMacOSAppearanceFallback()) return;
+	// Capture the current scope so the callback can re-enter it.
+	macOSScope = getSessionScope();
 	try {
-		macOSReportedAppearance = detectMacOSAppearance() ?? undefined;
+		const initialAppearance = detectMacOSAppearance() ?? undefined;
+		if (macOSScope) {
+			runWithSessionScope(macOSScope, () => macOSReportedAppearanceSlot.set(initialAppearance));
+		} else {
+			macOSReportedAppearanceSlot.set(initialAppearance);
+		}
 		macObserver = MacAppearanceObserver.start((err, appearance) => {
 			if (!err && (appearance === "dark" || appearance === "light")) {
-				macOSReportedAppearance = appearance;
-				reevaluateAutoTheme("macOS fallback");
+				if (macOSScope) {
+					runWithSessionScope(macOSScope, () => {
+						macOSReportedAppearanceSlot.set(appearance);
+						reevaluateAutoTheme("macOS fallback");
+					});
+				} else {
+					macOSReportedAppearanceSlot.set(appearance);
+					reevaluateAutoTheme("macOS fallback");
+				}
 			}
 		});
 	} catch (err) {
@@ -2661,7 +2679,10 @@ function stopMacAppearanceObserver(): void {
 		macObserver.stop();
 		macObserver = undefined;
 	}
-	macOSReportedAppearance = undefined;
+	macOSScope = undefined;
+	if (getSessionScope()) {
+		macOSReportedAppearanceSlot.set(undefined);
+	}
 }
 
 // ============================================================================

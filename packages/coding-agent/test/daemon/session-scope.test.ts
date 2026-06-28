@@ -41,7 +41,9 @@ function makeScope(sessionId: string): SessionScope {
 		autoLightTheme: "light",
 		autoDetectedTheme: false,
 		terminalReportedAppearance: undefined,
+		macOSReportedAppearance: undefined,
 		themeLoadRequestId: 0,
+		themeEpoch: 0,
 		hostUriHandlers: new Map(),
 	};
 }
