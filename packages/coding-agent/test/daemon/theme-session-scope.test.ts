@@ -177,4 +177,38 @@ describe("theme session scope isolation", () => {
 		expect(runWithSessionScope(scopeA, () => getThemeEpoch())).toBe(1); // A's epoch unchanged
 		expect(runWithSessionScope(scopeB, () => getThemeEpoch())).toBe(1);
 	});
+	// macOS appearance observer fan-out: the observer is a process-global
+	// singleton that writes `macOSReportedAppearance` into each live scope.
+	// This test proves the underlying slot contract: per-scope isolation
+	// and teardown-only-clears-its-own semantics. The observer's Set
+	// iteration (startMacAppearanceObserver) relies on this contract.
+	it("macOSReportedAppearance slot is isolated per session and cleanup only clears disconnecting scope", () => {
+		const scopeA = makeScope("A");
+		const scopeB = makeScope("B");
+
+		// Both scopes start with undefined appearance
+		expect(runWithSessionScope(scopeA, () => scopeA.macOSReportedAppearance)).toBeUndefined();
+		expect(runWithSessionScope(scopeB, () => scopeB.macOSReportedAppearance)).toBeUndefined();
+
+		// Simulate observer fan-out: set "dark" in A, "light" in B.
+		runWithSessionScope(scopeA, () => {
+			scopeA.macOSReportedAppearance = "dark";
+		});
+		runWithSessionScope(scopeB, () => {
+			scopeB.macOSReportedAppearance = "light";
+		});
+
+		// Each scope reads its own appearance — no cross-contamination.
+		expect(runWithSessionScope(scopeA, () => scopeA.macOSReportedAppearance)).toBe("dark");
+		expect(runWithSessionScope(scopeB, () => scopeB.macOSReportedAppearance)).toBe("light");
+
+		// Simulate session A teardown: clear only A's slot.
+		runWithSessionScope(scopeA, () => {
+			scopeA.macOSReportedAppearance = undefined;
+		});
+
+		// A cleared, B untouched.
+		expect(runWithSessionScope(scopeA, () => scopeA.macOSReportedAppearance)).toBeUndefined();
+		expect(runWithSessionScope(scopeB, () => scopeB.macOSReportedAppearance)).toBe("light");
+	});
 });

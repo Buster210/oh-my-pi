@@ -29,7 +29,7 @@ import { JSONC, YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
-import { getSessionScope, runWithSessionScope } from "../modes/daemon/session-scope";
+import { getSessionScope, runWithSessionScope, type SessionScope } from "../modes/daemon/session-scope";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
 import { normalizeToolName } from "../tools/builtin-names";
@@ -1495,7 +1495,7 @@ type SettingHook<P extends SettingPath> = (value: SettingValue<P>, prev: Setting
  * @typeParam A - argument tuple forwarded to each listener on `fire`.
  */
 class SettingSignal<A extends unknown[] = []> {
-	#listeners = new Map<(...args: A) => void, ReturnType<typeof getSessionScope>>();
+	#listeners = new Map<(...args: A) => void, SessionScope | undefined>();
 
 	constructor(private readonly label: string) {}
 

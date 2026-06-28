@@ -14,7 +14,7 @@ import { adjustHsv, colorLuma, getCustomThemesDir, isEnoent, logger, relativeLum
 import { type } from "arktype";
 import chalk from "chalk";
 import { LRUCache } from "lru-cache/raw";
-import { getSessionScope, runWithSessionScope, scopedSlot } from "../daemon/session-scope";
+import { getSessionScope, runWithSessionScope, type SessionScope, scopedSlot } from "../daemon/session-scope";
 // Embed theme JSON files at build time
 import darkThemeJson from "./dark.json" with { type: "json" };
 import { defaultThemes } from "./defaults";
@@ -2282,7 +2282,7 @@ function setAutoLightTheme(name: string): void {
 export interface ThemeChangeEvent {
 	ephemeral?: boolean;
 }
-const onThemeChangeCallbacks = new Map<(event: ThemeChangeEvent) => void, ReturnType<typeof getSessionScope>>();
+const onThemeChangeCallbacks = new Map<(event: ThemeChangeEvent) => void, SessionScope | undefined>();
 const themeLoadRequestIdSlot = scopedSlot("themeLoadRequestId", 0);
 const themeEpochSlot = scopedSlot("themeEpoch", 0);
 
@@ -2637,33 +2637,44 @@ function reevaluateAutoTheme(debugLabel: string, event: ThemeChangeEvent = {}): 
 // macOS Appearance Fallback Observer
 // ============================================================================
 
-// ponytail: process-level OS callback, can't be made per-session. Only
-// reachable with enableWatcher=true on macOS+Zellij. The observer callback
-// runs outside any scope, so we capture the scope at startup and re-enter
-// it when the callback fires. See the SIGWINCH ponytail above for context.
+// ponytail: one OS callback shared by all session scopes — can't be made
+// per-session (it's a process-level handle). Each session registers its
+// scope; the callback fans out to all live scopes. Only reachable with
+// enableWatcher=true on macOS+Zellij.
 var macObserver: { stop(): void } | undefined;
-var macOSScope: ReturnType<typeof getSessionScope> | undefined;
+const macObserverScopes = new Set<SessionScope>();
 
 function startMacAppearanceObserver(): void {
-	stopMacAppearanceObserver();
 	if (!shouldUseMacOSAppearanceFallback()) return;
-	// Capture the current scope so the callback can re-enter it.
-	macOSScope = getSessionScope();
+	// Register only actual observer participants — adding before the guard
+	// would retain every daemon session's scope forever on non-mac paths.
+	const scope = getSessionScope();
+	if (scope) macObserverScopes.add(scope);
+	if (macObserver) {
+		// Observer already running — just ensure the new scope gets the initial appearance.
+		if (scope) {
+			const initialAppearance = detectMacOSAppearance() ?? undefined;
+			runWithSessionScope(scope, () => macOSReportedAppearanceSlot.set(initialAppearance));
+		}
+		return;
+	}
 	try {
 		const initialAppearance = detectMacOSAppearance() ?? undefined;
-		if (macOSScope) {
-			runWithSessionScope(macOSScope, () => macOSReportedAppearanceSlot.set(initialAppearance));
+		if (scope) {
+			runWithSessionScope(scope, () => macOSReportedAppearanceSlot.set(initialAppearance));
 		} else {
 			macOSReportedAppearanceSlot.set(initialAppearance);
 		}
 		macObserver = MacAppearanceObserver.start((err, appearance) => {
 			if (!err && (appearance === "dark" || appearance === "light")) {
-				if (macOSScope) {
-					runWithSessionScope(macOSScope, () => {
+				for (const s of macObserverScopes) {
+					runWithSessionScope(s, () => {
 						macOSReportedAppearanceSlot.set(appearance);
 						reevaluateAutoTheme("macOS fallback");
 					});
-				} else {
+				}
+				// Standalone fallback: no session scope, write directly.
+				if (macObserverScopes.size === 0) {
 					macOSReportedAppearanceSlot.set(appearance);
 					reevaluateAutoTheme("macOS fallback");
 				}
@@ -2675,13 +2686,18 @@ function startMacAppearanceObserver(): void {
 }
 
 function stopMacAppearanceObserver(): void {
-	if (macObserver) {
-		macObserver.stop();
-		macObserver = undefined;
-	}
-	macOSScope = undefined;
-	if (getSessionScope()) {
+	const scope = getSessionScope();
+	if (scope) {
+		macObserverScopes.delete(scope);
+		runWithSessionScope(scope, () => macOSReportedAppearanceSlot.set(undefined));
+	} else {
 		macOSReportedAppearanceSlot.set(undefined);
+	}
+	if (macObserverScopes.size === 0) {
+		if (macObserver) {
+			macObserver.stop();
+			macObserver = undefined;
+		}
 	}
 }
 
