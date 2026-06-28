@@ -94,14 +94,31 @@ async function withPatchedCwd<T>(dir: string, fn: () => Promise<T>): Promise<T> 
 }
 
 let puppeteerModule: typeof Puppeteer | undefined;
+let puppeteerModulePromise: Promise<typeof Puppeteer> | undefined;
 export async function loadPuppeteer(): Promise<typeof Puppeteer> {
 	if (puppeteerModule) return puppeteerModule;
-	const safeDir = getPuppeteerDir();
-	await Bun.write(path.join(safeDir, "package.json"), "{}");
-	return withPatchedCwd(safeDir, async () => {
-		puppeteerModule = (await import("puppeteer-core")).default;
-		return puppeteerModule;
-	});
+	if (puppeteerModulePromise) return puppeteerModulePromise;
+
+	// Sync-arm the promise so concurrent callers dedup without a second withPatchedCwd race.
+	const promise = (async () => {
+		const safeDir = getPuppeteerDir();
+		await Bun.write(path.join(safeDir, "package.json"), "{}");
+		return withPatchedCwd(safeDir, async () => {
+			puppeteerModule = (await import("puppeteer-core")).default;
+			return puppeteerModule;
+		});
+	})();
+	puppeteerModulePromise = promise;
+	try {
+		return await promise;
+	} finally {
+		puppeteerModulePromise = undefined;
+	}
+}
+
+export function resetPuppeteerModuleForTests(): void {
+	puppeteerModule = undefined;
+	puppeteerModulePromise = undefined;
 }
 
 let puppeteerModuleWorker: typeof Puppeteer | undefined;
