@@ -17,7 +17,6 @@ afterEach(() => {
 	server = undefined;
 });
 
-// Stand up a real UDS pair; return [hostSideSocket, clientSideSocket].
 function pair(): Promise<[net.Socket, net.Socket]> {
 	return new Promise(resolve => {
 		const path = join(tmpdir(), `sti-${process.pid}-${Math.floor(performance.now() * 1000)}.sock`);
@@ -32,7 +31,7 @@ function pair(): Promise<[net.Socket, net.Socket]> {
 }
 
 /** Stands up a UDS pair plus the terminal under test wired to the host side. */
-async function setup(runInScope?: (fn: () => void) => void) {
+async function setup(runInScope?: <T>(fn: () => T) => T) {
 	const [host, client] = await pair();
 	const terminal = new SocketTerminal(host, 80, 24, runInScope);
 	return { host, client, terminal };
@@ -65,10 +64,8 @@ test("input arriving before start() is buffered and flushed in order", async () 
 		d => received.push(d),
 		() => {},
 	);
-	// Flushed synchronously on attach, preserving order.
 	expect(received.join("")).toBe("hello");
 
-	// After flush, live input still flows and the buffer doesn't re-deliver.
 	client.write(encodeFrame(FRAME_INPUT, Buffer.from("!", "utf8")));
 	await Bun.sleep(30);
 	expect(received.join("")).toBe("hello!");
@@ -123,7 +120,12 @@ test("split frames reassemble across chunk boundaries", async () => {
 // independent frame-code -> single-shot-promise pairs with identical
 // round-trip and never-sent shapes.
 const singleShotCases = [
-	{ frame: FRAME_CWD, wait: (t: SocketTerminal, ms: number) => t.waitForCwd(ms), value: "/Users/alice/project", label: "waitForCwd" },
+	{
+		frame: FRAME_CWD,
+		wait: (t: SocketTerminal, ms: number) => t.waitForCwd(ms),
+		value: "/Users/alice/project",
+		label: "waitForCwd",
+	},
 	{
 		frame: FRAME_RESUME,
 		wait: (t: SocketTerminal, ms: number) => t.waitForResumeSessionId(ms),

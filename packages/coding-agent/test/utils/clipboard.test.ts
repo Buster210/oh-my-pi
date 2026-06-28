@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import type { SessionScope } from "@oh-my-pi/pi-coding-agent/modes/daemon/session-scope";
+import { runWithSessionScope } from "@oh-my-pi/pi-coding-agent/modes/daemon/session-scope";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
 	readImageFromClipboard,
 	readMacFileUrlsFromClipboard,
@@ -282,5 +285,107 @@ describe("readTextFromClipboard", () => {
 		// If the read blocked the loop, ticks would stay at 0. A yielding
 		// implementation fires several ticks in the ~80ms window.
 		expect(ticks).toBeGreaterThanOrEqual(2);
+	});
+});
+
+function makeDaemonScope(terminalOut: ((data: string) => void) | undefined): SessionScope {
+	return {
+		sessionId: "clipboard-test",
+		agentRegistry: new AgentRegistry(),
+		settingsOverrides: new WeakMap(),
+		settings: null,
+		disabledProviders: new Set(),
+		autoQaConsentState: { handler: null, persistentSettings: null, cachedConsent: null, consentInFlight: null },
+		mcpManager: undefined,
+		asyncJobManager: undefined,
+		activeRules: [],
+		activeSkills: [],
+		preferredSearchProvider: "auto",
+		excludedSearchProviders: new Set(),
+		preferredImageProvider: "auto",
+		theme: undefined,
+		currentThemeName: undefined,
+		currentSymbolPresetOverride: undefined,
+		currentColorBlindMode: false,
+		autoDarkTheme: "dark",
+		autoLightTheme: "light",
+		autoDetectedTheme: false,
+		terminalReportedAppearance: undefined,
+		hostUriHandlers: new Map(),
+		terminalOut,
+	};
+}
+
+/**
+ * BLOCKER #6 regression: under a daemon session with `terminalOut` set (an RPC
+ * connection carrying a real client), the three read paths must never shell out
+ * to *this* host's OS clipboard — that would leak the host machine's (or an
+ * unrelated session's) clipboard content into this session. Pre-fix, all three
+ * functions called `pbpaste`/`osascript`/the native bridge unconditionally
+ * regardless of session scope; these tests fail against that code (spawnSpy/
+ * nativeSpy get called, and the gated sentinel isn't returned) and pass against
+ * the `getSessionScope()?.terminalOut` guard.
+ */
+describe("clipboard reads under a daemon session scope (#BLOCKER-6)", () => {
+	it("readTextFromClipboard returns '' and never spawns when terminalOut is set", async () => {
+		setPlatform("darwin");
+		const spawnSpy = vi.spyOn(Bun, "spawn");
+
+		const result = await runWithSessionScope(
+			makeDaemonScope(() => {}),
+			() => readTextFromClipboard(),
+		);
+
+		expect(result).toBe("");
+		expect(spawnSpy).not.toHaveBeenCalled();
+	});
+
+	it("readImageFromClipboard returns null and never spawns/calls native when terminalOut is set", async () => {
+		setPlatform("darwin");
+		const spawnSpy = vi.spyOn(Bun, "spawn");
+		const nativeSpy = vi.spyOn(native, "readImageFromClipboard");
+
+		const result = await runWithSessionScope(
+			makeDaemonScope(() => {}),
+			() => readImageFromClipboard(),
+		);
+
+		expect(result).toBeNull();
+		expect(spawnSpy).not.toHaveBeenCalled();
+		expect(nativeSpy).not.toHaveBeenCalled();
+	});
+
+	it("readMacFileUrlsFromClipboard returns [] and never spawns osascript when terminalOut is set", async () => {
+		setPlatform("darwin");
+		const spawnSpy = vi.spyOn(Bun, "spawn");
+
+		const result = await runWithSessionScope(
+			makeDaemonScope(() => {}),
+			() => readMacFileUrlsFromClipboard(),
+		);
+
+		expect(result).toEqual([]);
+		expect(spawnSpy).not.toHaveBeenCalled();
+	});
+
+	it("reads normally (no gate) when the session scope has no terminalOut", async () => {
+		setPlatform("darwin");
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, "hello");
+		vi.spyOn(native, "readImageFromClipboard").mockResolvedValue(null);
+
+		const textResult = await runWithSessionScope(makeDaemonScope(undefined), () => readTextFromClipboard());
+		expect(textResult).toBe("hello");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd).toEqual(["pbpaste"]);
+	});
+
+	it("reads normally (no gate) outside any session scope (standalone unchanged)", async () => {
+		setPlatform("darwin");
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, "hello-standalone");
+
+		expect(await readTextFromClipboard()).toBe("hello-standalone");
+		expect(calls).toHaveLength(1);
 	});
 });

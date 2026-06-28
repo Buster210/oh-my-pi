@@ -93,6 +93,9 @@ const MAC_FILE_URL_SCRIPT = [
  * unavailable, or when the pasteboard holds no file URLs.
  */
 export async function readMacFileUrlsFromClipboard(): Promise<string[]> {
+	// Gate clipboard reads when running under a daemon session with terminalOut
+	// (RPC connections would leak the host OS clipboard into unrelated sessions).
+	if (getSessionScope()?.terminalOut) return [];
 	if (process.platform !== "darwin") return [];
 	try {
 		const stdout = await spawnCapture(["osascript", "-"], { input: MAC_FILE_URL_SCRIPT });
@@ -300,6 +303,9 @@ async function readTextViaPowerShell(): Promise<string | null> {
  * @returns PNG payload or null when no image is available.
  */
 export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
+	// Gate clipboard reads when running under a daemon session with terminalOut
+	// (RPC connections would leak the host OS clipboard into unrelated sessions).
+	if (getSessionScope()?.terminalOut) return null;
 	if (process.env.TERMUX_VERSION) {
 		return null;
 	}
@@ -333,6 +339,9 @@ export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
  * Read plain text from the system clipboard.
  */
 export async function readTextFromClipboard(): Promise<string> {
+	// Gate clipboard reads when running under a daemon session with terminalOut
+	// (RPC connections would leak the host OS clipboard into unrelated sessions).
+	if (getSessionScope()?.terminalOut) return "";
 	try {
 		const p = process.platform;
 		if (p === "darwin") {

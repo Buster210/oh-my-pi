@@ -199,6 +199,15 @@ export function setProjectDir(dir: string): void {
 		store.cwd = standardizeMacOSPath(path.resolve(dir));
 		return;
 	}
+	// Defense-in-depth (#BLOCKER-2): a daemon session with no cwdScope store is a
+	// bug in the caller (it should always wrap the session in runWithProjectDir),
+	// but if that ever regresses, refuse the process-wide chdir rather than
+	// silently corrupting every other concurrent session's OS cwd.
+	if (daemonSessionScope.getStore()) {
+		throw new Error(
+			"setProjectDir: no cwd scope active inside a daemon session — refusing process.chdir() (would corrupt every other concurrent session's cwd). This is a caller bug: the session must be wrapped in runWithProjectDir.",
+		);
+	}
 	projectDir = standardizeMacOSPath(path.resolve(dir));
 	process.chdir(projectDir);
 }

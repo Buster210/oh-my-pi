@@ -1856,7 +1856,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		try {
 			switch (selector.kind) {
 				case "list": {
-					const listLimit = applyListLimit(await listTables(resolvedSqlitePath.absolutePath), { limit: 500 });
+					const listLimit = applyListLimit(await listTables(resolvedSqlitePath.absolutePath, { signal }), { limit: 500 });
 					const output = prependSuffixResolutionNotice(
 						renderTableList(listLimit.items),
 						resolvedSqlitePath.suffixResolution,
@@ -1876,8 +1876,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const sampleRows = await queryRows(resolvedSqlitePath.absolutePath, selector.table, {
 						limit: selector.sampleLimit,
 						offset: 0,
-					});
-					let output = renderSchema(await getTableSchema(resolvedSqlitePath.absolutePath, selector.table), {
+					}, { signal });
+					let output = renderSchema(await getTableSchema(resolvedSqlitePath.absolutePath, selector.table, { signal }), {
 						columns: sampleRows.columns,
 						rows: sampleRows.rows,
 					});
@@ -1891,11 +1891,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						.done();
 				}
 				case "row": {
-					const lookup = await resolveTableRowLookup(resolvedSqlitePath.absolutePath, selector.table);
+					const lookup = await resolveTableRowLookup(resolvedSqlitePath.absolutePath, selector.table, { signal });
 					const row =
 						lookup.kind === "pk"
-							? await getRowByKey(resolvedSqlitePath.absolutePath, selector.table, lookup, selector.key)
-							: await getRowByRowId(resolvedSqlitePath.absolutePath, selector.table, selector.key);
+							? await getRowByKey(resolvedSqlitePath.absolutePath, selector.table, lookup, selector.key, { signal })
+							: await getRowByRowId(resolvedSqlitePath.absolutePath, selector.table, selector.key, { signal });
 					if (!row) {
 						return toolResult<ReadToolDetails>(details)
 							.text(
@@ -1913,7 +1913,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						.done();
 				}
 				case "query": {
-					const page = await queryRows(resolvedSqlitePath.absolutePath, selector.table, selector);
+					const page = await queryRows(resolvedSqlitePath.absolutePath, selector.table, selector, { signal });
 					return toolResult<ReadToolDetails>(details)
 						.text(
 							prependSuffixResolutionNotice(
@@ -1931,7 +1931,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						.done();
 				}
 				case "raw": {
-					const result = await executeReadQuery(resolvedSqlitePath.absolutePath, selector.sql);
+					const result = await executeReadQuery(resolvedSqlitePath.absolutePath, selector.sql, { signal });
 					let output = renderTable(result.columns, result.rows, {
 						totalCount: result.rows.length,
 						offset: 0,

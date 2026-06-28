@@ -12,15 +12,17 @@
  *    connection's socket. Rendered bytes stream to the client raw; client
  *    keystrokes/resize come back framed. "Server-side render, dumb-pipe
  *    client" — the client never runs its own TUI, just relays bytes.
- *    Single-connection-at-a-time is in scope for this phase; the
- *    multi-tenancy singleton refactors (settings/AgentRegistry/auto-QA
- *    consent) are a later milestone.
+ *
+ * Per-connection session isolation is enforced via AsyncLocalStorage: each
+ * connection gets its own SessionScope with scoped capability context, theme,
+ * settings, clipboard, and cwd. Four concurrent TUI sessions are supported.
  */
 
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import { $env, logger, postmortem, runWithNotificationsSuppressed, VERSION } from "@oh-my-pi/pi-utils";
 import { APP_NAME, runWithDaemonSessionScope, runWithProjectDir } from "@oh-my-pi/pi-utils/dirs";
+import type { Settings } from "../../config/settings";
 import { runInteractiveMode } from "../../main";
 import { AgentRegistry } from "../../registry/agent-registry";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../../sdk";
@@ -50,13 +52,23 @@ export function gracefulShutdownMarkerPath(socketPath: string): string {
 export const TUI_SESSION_END_SENTINEL = `\x00${JSON.stringify({ omp: "end" })}\n`;
 
 let connSeq = 0;
-/** Fresh per-connection scope so concurrent sessions never share Settings overrides, AgentRegistry, or auto-QA consent. */
-function newSessionScope(): SessionScope {
+/**
+ * Fresh per-connection scope so concurrent sessions never share Settings
+ * overrides, AgentRegistry, or auto-QA consent. `settings` is seeded from the
+ * daemon's persisted Settings instance (shared by reference — the copy-on-write
+ * overrides layer, not this reference, is what keeps sessions isolated) and
+ * `disabledProviders` is seeded from that instance's persisted list, so a new
+ * session starts with the user's actual disabled-provider state instead of an
+ * empty Set (#BLOCKER-1).
+ */
+export function newSessionScope(settings: Settings | undefined): SessionScope {
 	connSeq += 1;
 	return {
 		sessionId: `conn-${connSeq}`,
 		agentRegistry: new AgentRegistry(),
 		settingsOverrides: new WeakMap(),
+		settings: settings ?? null,
+		disabledProviders: new Set(settings?.get("disabledProviders") ?? []),
 		autoQaConsentState: { handler: null, persistentSettings: null, cachedConsent: null, consentInFlight: null },
 		mcpManager: undefined,
 		asyncJobManager: undefined,
@@ -71,6 +83,8 @@ function newSessionScope(): SessionScope {
 		currentColorBlindMode: false,
 		autoDarkTheme: "dark",
 		autoLightTheme: "light",
+		autoDetectedTheme: false,
+		terminalReportedAppearance: undefined,
 		hostUriHandlers: new Map(),
 	};
 }
@@ -146,6 +160,16 @@ export function createDaemonIdleShutdown(lingerMs: number, shutdown: () => void)
 export function defaultSocketPath(): string {
 	const uid = process.getuid?.() ?? process.pid;
 	return `${DEFAULT_SOCKET_DIR}/${APP_NAME}-${uid}.sock`;
+}
+
+/**
+ * Determines whether a server error should be fatal. Before the server is listening,
+ * errors (e.g. EADDRINUSE, bind failure) are fatal — the daemon can't operate.
+ * After listening, runtime errors (e.g. EMFILE under fd churn) are logged but
+ * non-fatal: the shared host must survive them to keep serving other sessions.
+ */
+export function isFatalServerError(hasListened: boolean): boolean {
+	return !hasListened;
 }
 
 /**
@@ -228,7 +252,7 @@ export async function runDaemonHost(options: DaemonHostOptions): Promise<void> {
 			const onExit = () => {
 				if (socket.writable) socket.end(TUI_SESSION_END_SENTINEL);
 			};
-			const scope = newSessionScope();
+			const scope = newSessionScope(options.sessionOptions.settings);
 			// Assigned once the client cwd is known; until then dispatch runs bare,
 			// which only covers the pre-session CWD/RESIZE handshake frames.
 			let sessionContext: (<T>(fn: () => T) => T) | undefined;
@@ -249,7 +273,7 @@ export async function runDaemonHost(options: DaemonHostOptions): Promise<void> {
 				]);
 				const cwd = clientCwd ?? options.sessionOptions.cwd ?? process.cwd();
 				logger.info("daemon: tui session cwd", { sessionId: scope.sessionId, cwd });
-				const runScoped = <T>(fn: () => T): T => (clientCwd ? runWithProjectDir(clientCwd, fn) : fn());
+				const runScoped = <T>(fn: () => T): T => runWithProjectDir(cwd, fn);
 				const withScope = <T>(fn: () => T): T =>
 					runWithNotificationsSuppressed(() =>
 						runWithDaemonSessionScope(() => runScoped(() => runWithSessionScope(scope, fn))),
@@ -260,13 +284,12 @@ export async function runDaemonHost(options: DaemonHostOptions): Promise<void> {
 						const sessionManager = resumeSessionId
 							? await reopenResumableSession(resumeSessionId, cwd)
 							: undefined;
-						const { session, setToolUIContext, lspServers, mcpManager, eventBus } =
-							await options.createSession({
-								...options.sessionOptions,
-								cwd,
-								hasUI: true,
-								...(sessionManager ? { sessionManager } : {}),
-							});
+						const { session, setToolUIContext, lspServers, mcpManager, eventBus } = await options.createSession({
+							...options.sessionOptions,
+							cwd,
+							hasUI: true,
+							...(sessionManager ? { sessionManager } : {}),
+						});
 						// Handshake: tell the client which session it's attached to, before any
 						// TUI render bytes hit the socket, so a later reconnect can send it back
 						// as FRAME_RESUME. One `\n`-terminated JSON line, then the socket is the
@@ -306,14 +329,19 @@ export async function runDaemonHost(options: DaemonHostOptions): Promise<void> {
 			if (!socket.destroyed) socket.end();
 		};
 
-		const runScoped = <T>(fn: () => T): T =>
-			options.sessionOptions.cwd ? runWithProjectDir(options.sessionOptions.cwd, fn) : fn();
+		// Always enter runWithProjectDir with a resolved cwd (mirroring the TUI
+		// branch's fallback chain) — never skip scoping. Skipping it left this
+		// connection with no cwdScope store, so a `/move` on this session hit
+		// dirs.ts's unguarded process.chdir() fallback and corrupted every other
+		// concurrent session's OS cwd (#BLOCKER-2).
+		const cwd = options.sessionOptions.cwd ?? process.cwd();
+		const runScoped = <T>(fn: () => T): T => runWithProjectDir(cwd, fn);
 		const input = socketToReadable(socket);
 		const output = (data: string) => {
 			if (!socket.destroyed) socket.write(data);
 		};
 
-		const scope = newSessionScope();
+		const scope = newSessionScope(options.sessionOptions.settings);
 		void runWithNotificationsSuppressed(() =>
 			runWithDaemonSessionScope(() =>
 				runScoped(() =>
@@ -331,13 +359,19 @@ export async function runDaemonHost(options: DaemonHostOptions): Promise<void> {
 		);
 	});
 
+	let hasListened = false;
 	server.on("error", err => {
-		logger.error("daemon: server error", { error: String(err) });
-		process.exit(1);
+		if (isFatalServerError(hasListened)) {
+			logger.error("daemon: server listen failure", { error: String(err) });
+			process.exit(1);
+		} else {
+			logger.error("daemon: server runtime error", { error: String(err) });
+		}
 	});
 
 	await new Promise<void>(resolve => {
 		server.listen(socketPath, () => {
+			hasListened = true;
 			logger.info("daemon: listening", { path: socketPath });
 			process.stdout.write(`${JSON.stringify({ type: "daemon_ready", socketPath })}\n`);
 			resolve();

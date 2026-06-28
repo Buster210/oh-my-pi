@@ -23,6 +23,8 @@ function makeScope(sessionId: string): SessionScope {
 		sessionId,
 		agentRegistry: new AgentRegistry(),
 		settingsOverrides: new WeakMap(),
+		settings: null,
+		disabledProviders: new Set(),
 		autoQaConsentState: { handler: null, persistentSettings: null, cachedConsent: null, consentInFlight: null },
 		mcpManager: undefined,
 		asyncJobManager: undefined,
@@ -37,6 +39,8 @@ function makeScope(sessionId: string): SessionScope {
 		currentColorBlindMode: false,
 		autoDarkTheme: "dark",
 		autoLightTheme: "light",
+		autoDetectedTheme: false,
+		terminalReportedAppearance: undefined,
 		hostUriHandlers: new Map(),
 	};
 }

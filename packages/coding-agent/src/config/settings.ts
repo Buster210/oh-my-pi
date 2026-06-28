@@ -29,7 +29,7 @@ import { JSONC, YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
-import { getSessionScope } from "../modes/daemon/session-scope";
+import { getSessionScope, runWithSessionScope } from "../modes/daemon/session-scope";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
 import { normalizeToolName } from "../tools/builtin-names";
@@ -1495,13 +1495,14 @@ type SettingHook<P extends SettingPath> = (value: SettingValue<P>, prev: Setting
  * @typeParam A - argument tuple forwarded to each listener on `fire`.
  */
 class SettingSignal<A extends unknown[] = []> {
-	#listeners = new Set<(...args: A) => void>();
+	#listeners = new Map<(...args: A) => void, ReturnType<typeof getSessionScope>>();
 
 	constructor(private readonly label: string) {}
 
 	/** Subscribe `cb`; returns an unsubscribe function. */
 	on(cb: (...args: A) => void): () => void {
-		this.#listeners.add(cb);
+		const scope = getSessionScope();
+		this.#listeners.set(cb, scope);
 		return () => {
 			this.#listeners.delete(cb);
 		};
@@ -1512,12 +1513,16 @@ class SettingSignal<A extends unknown[] = []> {
 	 * (un)subscribe mid-fire without re-entrancy — the Hindsight backend
 	 * re-registers the fresh state's listener on every rebuild — and wraps each
 	 * call so a throwing listener is logged and skipped instead of aborting the
-	 * rest.
+	 * rest. Re-enters each listener's captured SessionScope (#BLOCKER-4).
 	 */
 	fire(...args: A): void {
-		for (const cb of [...this.#listeners]) {
+		for (const [cb, scope] of [...this.#listeners]) {
 			try {
-				cb(...args);
+				if (scope) {
+					runWithSessionScope(scope, () => cb(...args));
+				} else {
+					cb(...args);
+				}
 			} catch (err) {
 				logger.warn(`Settings: ${this.label} hook failed`, { error: String(err) });
 			}

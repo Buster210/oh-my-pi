@@ -3,9 +3,11 @@ import {
 	__resetDirsFromEnvForTests,
 	getActiveProfile,
 	getConfigRootDir,
+	getProjectDir,
 	runWithDaemonSessionScope,
 	setAgentDir,
 	setProfile,
+	setProjectDir,
 } from "@oh-my-pi/pi-utils/dirs";
 
 describe("setProfile / setAgentDir daemon-session guard", () => {
@@ -68,5 +70,25 @@ describe("setProfile / setAgentDir daemon-session guard", () => {
 		expect(a).toContain("not available in shared-daemon sessions");
 		expect(b).toContain("not available in shared-daemon sessions");
 		expect(getConfigRootDir()).toBe(rootBefore);
+	});
+});
+
+// BLOCKER #2: an RPC/ACP daemon connection with no handshake cwd used to skip
+// `runWithProjectDir` entirely, leaving the session inside `daemonSessionScope`
+// but with no `cwdScope` store. `/move` then called `setProjectDir()`, which
+// (pre-fix) fell straight through to the module-global `process.chdir()` —
+// corrupting every other concurrent session's OS cwd. `setProjectDir` now
+// refuses that fallback and throws instead, mirroring the `setProfile`/
+// `setAgentDir` guard above.
+describe("setProjectDir daemon-session guard (no cwdScope store)", () => {
+	it("throws when called inside a daemon session scope with no runWithProjectDir wrapper", async () => {
+		const cwdBefore = getProjectDir();
+
+		await runWithDaemonSessionScope(async () => {
+			expect(() => setProjectDir("/tmp/should-not-apply")).toThrow("daemon session");
+		});
+
+		// The module-global cwd is untouched — the corruption path never fired.
+		expect(getProjectDir()).toBe(cwdBefore);
 	});
 });

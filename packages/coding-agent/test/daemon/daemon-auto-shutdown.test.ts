@@ -1,5 +1,9 @@
 import { afterEach, expect, test, vi } from "bun:test";
-import { createDaemonIdleShutdown, shouldShutdownOnSignal } from "@oh-my-pi/pi-coding-agent/modes/daemon/daemon-host";
+import {
+	createDaemonIdleShutdown,
+	isFatalServerError,
+	shouldShutdownOnSignal,
+} from "@oh-my-pi/pi-coding-agent/modes/daemon/daemon-host";
 import { postmortem } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
@@ -71,4 +75,13 @@ test("terminal signals never shut down a daemon with clients attached", () => {
 	expect(shouldShutdownOnSignal(postmortem.Reason.SIGINT, false)).toBe(true);
 	expect(shouldShutdownOnSignal(postmortem.Reason.SIGHUP, false)).toBe(true);
 	expect(shouldShutdownOnSignal(postmortem.Reason.SIGTERM, false)).toBe(true);
+});
+
+test("server error before listen is fatal, after listen is non-fatal", () => {
+	// Regression: runtime server errors (e.g. EMFILE under fd churn) killed the
+	// whole shared host, dropping every live session. Errors during the listen
+	// phase (bind failure, EADDRINUSE) are still fatal — the daemon cannot
+	// operate without a listening socket.
+	expect(isFatalServerError(false)).toBe(true); // pre-listen: fatal
+	expect(isFatalServerError(true)).toBe(false); // post-listen: survive
 });

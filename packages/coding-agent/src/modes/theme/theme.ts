@@ -14,7 +14,7 @@ import { adjustHsv, colorLuma, getCustomThemesDir, isEnoent, logger, relativeLum
 import { type } from "arktype";
 import chalk from "chalk";
 import { LRUCache } from "lru-cache/raw";
-import { scopedSlot } from "../daemon/session-scope";
+import { getSessionScope, runWithSessionScope, scopedSlot } from "../daemon/session-scope";
 // Embed theme JSON files at build time
 import darkThemeJson from "./dark.json" with { type: "json" };
 import { defaultThemes } from "./defaults";
@@ -2107,7 +2107,10 @@ export async function getThemeByName(name: string): Promise<Theme | undefined> {
 }
 
 /** Appearance detected via OSC 11 background color query, or undefined if not yet available. */
-var terminalReportedAppearance: "dark" | "light" | undefined;
+const terminalReportedAppearanceSlot = scopedSlot(
+	"terminalReportedAppearance",
+	undefined as "dark" | "light" | undefined,
+);
 
 /** Appearance reported by the macOS fallback observer, or undefined if not yet available. */
 var macOSReportedAppearance: "dark" | "light" | undefined;
@@ -2121,8 +2124,8 @@ function shouldUseMacOSAppearanceFallback(): boolean {
 
 function detectTerminalBackground(): "dark" | "light" {
 	// Tier 1: terminal-reported appearance from OSC 11 luminance.
-	if (!shouldUseMacOSAppearanceFallback() && terminalReportedAppearance) {
-		return terminalReportedAppearance;
+	if (!shouldUseMacOSAppearanceFallback() && terminalReportedAppearanceSlot.get()) {
+		return terminalReportedAppearanceSlot.get()!;
 	}
 
 	// Tier 2: COLORFGBG env var (static at process start, but still terminal-derived).
@@ -2253,7 +2256,7 @@ function setColorBlindModeInternal(enabled: boolean): void {
 var themeWatcher: fs.FSWatcher | undefined;
 var themeReloadTimer: NodeJS.Timeout | undefined;
 var sigwinchHandler: (() => void) | undefined;
-var autoDetectedTheme: boolean = false;
+const autoDetectedThemeSlot = scopedSlot("autoDetectedTheme", false);
 const autoDarkThemeSlot = scopedSlot("autoDarkTheme", "dark");
 const autoLightThemeSlot = scopedSlot("autoLightTheme", "light");
 
@@ -2272,14 +2275,15 @@ function getAutoLightTheme(): string {
 function setAutoLightTheme(name: string): void {
 	autoLightThemeSlot.set(name);
 }
-// ponytail: a Set, not a single slot — the daemon runs multiple concurrent
+// ponytail: a Map, not a single slot — the daemon runs multiple concurrent
 // TUI sessions in one process, each registering its own listener via
 // onThemeChange(); a single slot meant only the last-registered session's
-// TUI ever heard about theme changes.
+// TUI ever heard about theme changes. Callbacks are stored with their captured
+// SessionScope so notifyThemeChange re-enters each listener's scope (#BLOCKER-3).
 export interface ThemeChangeEvent {
 	ephemeral?: boolean;
 }
-const onThemeChangeCallbacks = new Set<(event: ThemeChangeEvent) => void>();
+const onThemeChangeCallbacks = new Map<(event: ThemeChangeEvent) => void, ReturnType<typeof getSessionScope>>();
 var themeLoadRequestId: number = 0;
 let themeEpoch = 0;
 
@@ -2297,7 +2301,7 @@ export async function initTheme(
 	darkTheme?: string,
 	lightTheme?: string,
 ): Promise<void> {
-	autoDetectedTheme = true;
+	autoDetectedThemeSlot.set(true);
 	setAutoDarkTheme(darkTheme ?? "dark");
 	setAutoLightTheme(lightTheme ?? "light");
 	const name = getDefaultTheme();
@@ -2322,7 +2326,7 @@ export async function setTheme(
 	name: string,
 	enableWatcher: boolean = false,
 ): Promise<{ success: boolean; error?: string }> {
-	autoDetectedTheme = false;
+	autoDetectedThemeSlot.set(false);
 	setCurrentThemeNameInternal(name);
 	const requestId = ++themeLoadRequestId;
 	try {
@@ -2383,7 +2387,7 @@ export async function previewTheme(
  * Enable auto-detection mode, switching to the appropriate dark/light theme.
  */
 export function enableAutoTheme(event: ThemeChangeEvent = {}): void {
-	autoDetectedTheme = true;
+	autoDetectedThemeSlot.set(true);
 	reevaluateAutoTheme("enableAutoTheme", event);
 }
 
@@ -2408,13 +2412,13 @@ export function getAutoThemeMapping(mode: "dark" | "light"): string {
  * Mode 2031 notifications trigger re-queries rather than providing the value directly.
  */
 export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
-	if (terminalReportedAppearance === mode) return;
-	terminalReportedAppearance = mode;
+	if (terminalReportedAppearanceSlot.get() === mode) return;
+	terminalReportedAppearanceSlot.set(mode);
 	reevaluateAutoTheme("terminal appearance");
 }
 
 export function setThemeInstance(themeInstance: Theme): void {
-	autoDetectedTheme = false;
+	autoDetectedThemeSlot.set(false);
 	setGlobalOrScopedTheme(themeInstance);
 	setCurrentThemeNameInternal("<in-memory>");
 	stopThemeWatcher();
@@ -2481,7 +2485,8 @@ export function getColorBlindMode(): boolean {
 }
 
 export function onThemeChange(callback: (event: ThemeChangeEvent) => void): () => void {
-	onThemeChangeCallbacks.add(callback);
+	const scope = getSessionScope();
+	onThemeChangeCallbacks.set(callback, scope);
 	return () => {
 		onThemeChangeCallbacks.delete(callback);
 	};
@@ -2501,7 +2506,13 @@ export function getThemeEpoch(): number {
 /** Bump the theme epoch and notify the registered theme-change listener. */
 function notifyThemeChange(event: ThemeChangeEvent = {}): void {
 	themeEpoch++;
-	for (const callback of onThemeChangeCallbacks) callback(event);
+	for (const [callback, scope] of onThemeChangeCallbacks) {
+		if (scope) {
+			runWithSessionScope(scope, () => callback(event));
+		} else {
+			callback(event);
+		}
+	}
 }
 
 /**
@@ -2603,7 +2614,7 @@ async function startThemeWatcher(): Promise<void> {
  * Called from SIGWINCH, terminal appearance change handler, and macOS fallback observer.
  */
 function reevaluateAutoTheme(debugLabel: string, event: ThemeChangeEvent = {}): void {
-	if (!autoDetectedTheme) return;
+	if (!autoDetectedThemeSlot.get()) return;
 	const resolved = getDefaultTheme();
 	if (resolved === getCurrentThemeNameInternal()) return;
 	setCurrentThemeNameInternal(resolved);
@@ -2692,7 +2703,7 @@ export function stopThemeWatcher(): void {
 		themeWatcher = undefined;
 	}
 	stopSigwinchListener();
-	terminalReportedAppearance = undefined;
+	terminalReportedAppearanceSlot.set(undefined);
 }
 
 // ============================================================================

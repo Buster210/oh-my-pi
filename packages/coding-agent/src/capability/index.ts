@@ -6,12 +6,12 @@
  * - Registering providers (where to find it)
  * - Loading items for a capability across all providers
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
 
 import type { Settings } from "../config/settings";
+import { getSessionScope } from "../modes/daemon/session-scope";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
 import type {
 	Capability,
@@ -42,16 +42,22 @@ export interface CapabilityContext {
 	disabledProviders: Set<string>;
 }
 
-const capabilityALS = new AsyncLocalStorage<CapabilityContext>();
-
-/** Fallback when no ALS store is active — preserves single-process behaviour. */
+/** Fallback when no session scope is active — preserves single-process behaviour. */
 const defaultContext: CapabilityContext = {
 	settings: null,
 	disabledProviders: new Set<string>(),
 };
 
+/**
+ * Resolve the mutable capability context for the calling session. Inside a
+ * daemon connection this returns the *actual* `SessionScope` object (which
+ * structurally satisfies `CapabilityContext`) so mutations — `initializeWithSettings`
+ * seeding, `persistDisabledProviders` — land on that session's own state instead
+ * of a throwaway literal. Outside any scope (standalone CLI), falls back to the
+ * single module-level `defaultContext`, identical to pre-daemon behaviour.
+ */
 function currentContext(): CapabilityContext {
-	return capabilityALS.getStore() ?? defaultContext;
+	return getSessionScope() ?? defaultContext;
 }
 
 // =============================================================================
@@ -441,16 +447,6 @@ export function invalidate(filePath: string, cwd?: string): void {
  */
 export function cacheStats(): { content: number; dir: number } {
 	return fsCacheStats();
-}
-
-/**
- * Run `fn` within its own capability context. The daemon will call this to
- * isolate each hosted session's settings and disabled-provider set.
- * Without an explicit call, all code reads the default context (identical
- * to today's single-process behaviour).
- */
-export function runWithCapabilityContext<T>(ctx: CapabilityContext, fn: () => T): T {
-	return capabilityALS.run(ctx, fn);
 }
 
 // =============================================================================

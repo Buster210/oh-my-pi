@@ -21,6 +21,8 @@ function createTestScope(sessionId: string): SessionScope {
 		sessionId,
 		agentRegistry: {} as SessionScope["agentRegistry"],
 		settingsOverrides: new WeakMap(),
+		settings: null,
+		disabledProviders: new Set(),
 		autoQaConsentState: {
 			handler: null,
 			persistentSettings: null,
@@ -40,6 +42,8 @@ function createTestScope(sessionId: string): SessionScope {
 		currentColorBlindMode: false,
 		autoDarkTheme: "",
 		autoLightTheme: "",
+		autoDetectedTheme: false,
+		terminalReportedAppearance: undefined,
 		hostUriHandlers: new Map(),
 	} as SessionScope;
 }

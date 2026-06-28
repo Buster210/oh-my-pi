@@ -17,6 +17,8 @@ function makeScope(sink: (data: string) => void): SessionScope {
 		sessionId: "test",
 		agentRegistry: new AgentRegistry(),
 		settingsOverrides: new WeakMap(),
+		settings: null,
+		disabledProviders: new Set(),
 		autoQaConsentState: { handler: null, persistentSettings: null, cachedConsent: null, consentInFlight: null },
 		mcpManager: undefined,
 		asyncJobManager: undefined,
@@ -31,6 +33,8 @@ function makeScope(sink: (data: string) => void): SessionScope {
 		currentColorBlindMode: false,
 		autoDarkTheme: "dark",
 		autoLightTheme: "light",
+		autoDetectedTheme: false,
+		terminalReportedAppearance: undefined,
 		hostUriHandlers: new Map(),
 		terminalOut: sink,
 	};

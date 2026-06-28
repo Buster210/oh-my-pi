@@ -31,6 +31,9 @@ export interface SessionScope {
 	readonly sessionId: string;
 	readonly agentRegistry: AgentRegistry;
 	settingsOverrides: WeakMap<Settings, RawSettings>;
+	/** This session's persisted Settings instance, seeded at scope creation (#BLOCKER-1). */
+	settings: Settings | null;
+	disabledProviders: Set<string>;
 	autoQaConsentState: {
 		handler: AutoQaConsentHandler | null;
 		persistentSettings: Settings | null;
@@ -50,6 +53,8 @@ export interface SessionScope {
 	currentColorBlindMode: boolean;
 	autoDarkTheme: string;
 	autoLightTheme: string;
+	autoDetectedTheme: boolean;
+	terminalReportedAppearance: "dark" | "light" | undefined;
 	/**
 	 * Raw terminal-escape sink for this session's client (title/clipboard OSC
 	 * sequences). A function field — not a `SocketTerminal` import — keeps this

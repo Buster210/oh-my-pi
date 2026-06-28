@@ -8,7 +8,7 @@ import {
 	type SqliteWorkerRequestBase,
 	type SqliteWorkerResponse,
 } from "./sqlite-reader-protocol";
-import { ToolError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 
 const SQLITE_MAGIC = new Uint8Array([
 	0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00,
@@ -857,8 +857,47 @@ function spawnSqliteWorkerSlot(): SqliteWorkerSlot {
 	const worker = createSqliteWorker();
 	worker.unref();
 	const slot: SqliteWorkerSlot = { worker, busy: false, current: null };
-	worker.onmessage = event => handleSqliteWorkerMessage(slot, event.data as SqliteWorkerResponse);
-	worker.onerror = event => handleSqliteWorkerError(slot, event);
+
+	const onMessage = (event: MessageEvent): void => handleSqliteWorkerMessage(slot, event.data as SqliteWorkerResponse);
+	worker.addEventListener("message", onMessage);
+
+	const onError = (event: ErrorEvent): void => {
+		const message = event.error instanceof Error ? event.error.message : event.message || "sqlite reader worker error";
+		logger.warn("sqlite reader worker error", { error: message });
+		const pending = slot.current;
+		slot.current = null;
+		slot.busy = false;
+		if (pending && pending.state === "running") {
+			if (pending.timeout) clearTimeout(pending.timeout);
+			pending.timeout = null;
+			pending.state = "done";
+			pending.reject(new ToolError(message));
+		}
+		dropSqliteWorkerSlot(slot);
+		void slot.worker.terminate();
+		pumpSqliteWorkerQueue();
+	};
+	worker.addEventListener("error", onError);
+
+	const recycleWorker = (reason: string): void => {
+		logger.warn(`sqlite reader worker ${reason}; recycling`, { requestId: slot.current?.request?.id });
+		const pending = slot.current;
+		slot.current = null;
+		slot.busy = false;
+		if (pending && pending.state === "running") {
+			if (pending.timeout) clearTimeout(pending.timeout);
+			pending.timeout = null;
+			pending.state = "done";
+			pending.reject(new ToolError(`sqlite reader worker ${reason}`));
+		}
+		dropSqliteWorkerSlot(slot);
+		void slot.worker.terminate();
+		pumpSqliteWorkerQueue();
+	};
+	worker.addEventListener("messageerror", () => recycleWorker("message error"));
+	worker.addEventListener("close", () => recycleWorker("closed unexpectedly"));
+
+
 	return slot;
 }
 
@@ -884,23 +923,6 @@ function handleSqliteWorkerMessage(slot: SqliteWorkerSlot, message: SqliteWorker
 		pending.resolve(message.result as never);
 	}
 	slot.worker.unref();
-	pumpSqliteWorkerQueue();
-}
-
-function handleSqliteWorkerError(slot: SqliteWorkerSlot, event: ErrorEvent): void {
-	const message = event.error instanceof Error ? event.error.message : event.message || "sqlite reader worker error";
-	logger.warn("sqlite reader worker error", { error: message });
-	const pending = slot.current;
-	slot.current = null;
-	slot.busy = false;
-	if (pending && pending.state === "running") {
-		if (pending.timeout) clearTimeout(pending.timeout);
-		pending.timeout = null;
-		pending.state = "done";
-		pending.reject(new ToolError(message));
-	}
-	dropSqliteWorkerSlot(slot);
-	void slot.worker.terminate();
 	pumpSqliteWorkerQueue();
 }
 
@@ -967,9 +989,9 @@ function pumpSqliteWorkerQueue(): void {
 	}
 }
 
-function queueSqliteWorkerRequest<T>(request: SqliteWorkerRequestBase, timeoutMs: number): Promise<T> {
+function queueSqliteWorkerRequest<T>(request: SqliteWorkerRequestBase, options: SqliteWorkerCallOptions = {}): Promise<T> {
 	const { promise, resolve, reject } = Promise.withResolvers<T>();
-	const timerMs = Math.max(1, Math.floor(timeoutMs));
+	const timerMs = Math.max(1, Math.floor(options.timeoutMs ?? SQLITE_WORKER_TIMEOUT_MS));
 	const pending: SqlitePendingRequest<T> = {
 		request: { ...request, id: String(++nextSqliteRequestId) },
 		resolve,
@@ -978,6 +1000,40 @@ function queueSqliteWorkerRequest<T>(request: SqliteWorkerRequestBase, timeoutMs
 		state: "queued",
 		slot: null,
 	};
+
+	const abortSignal = options.signal;
+	if (abortSignal) {
+		if (abortSignal.aborted) {
+			pending.state = "done";
+			return Promise.reject(new ToolAbortError("SQLite read aborted"));
+		}
+		const onAbort = (): void => {
+			if (pending.state === "done") return;
+			pending.state = "done";
+			if (pending.timeout) clearTimeout(pending.timeout);
+			pending.timeout = null;
+			// If queued, just remove from queue.
+			const index = sqliteWorkerQueue.indexOf(pending as SqlitePendingRequest<unknown>);
+			if (index !== -1) {
+				sqliteWorkerQueue.splice(index, 1);
+				reject(new ToolAbortError("SQLite read aborted"));
+				pumpSqliteWorkerQueue();
+				return;
+			}
+			// If running, terminate the worker and recycle the slot (same as timeout).
+			const slot = pending.slot;
+			if (slot) {
+				slot.current = null;
+				slot.busy = false;
+				dropSqliteWorkerSlot(slot);
+				void slot.worker.terminate();
+			}
+			reject(new ToolAbortError("SQLite read aborted"));
+			pumpSqliteWorkerQueue();
+		};
+		abortSignal.addEventListener("abort", onAbort, { once: true });
+	}
+
 	pending.timeout = setTimeout(() => {
 		if (pending.state === "done") {
 			return;
@@ -1018,17 +1074,13 @@ function queueSqliteWorkerRequest<T>(request: SqliteWorkerRequestBase, timeoutMs
 	return promise;
 }
 
-function normalizeSqliteTimeout(options?: SqliteWorkerCallOptions): number {
-	return options?.timeoutMs ?? SQLITE_WORKER_TIMEOUT_MS;
-}
-
 export async function listTables(
 	sqlitePath: string,
 	options: { probeCap?: number } & SqliteWorkerCallOptions = {},
 ): Promise<SqliteTableSummary[]> {
 	return await queueSqliteWorkerRequest<SqliteTableSummary[]>(
 		{ type: "listTables", path: sqlitePath, probeCap: options.probeCap },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1039,7 +1091,7 @@ export async function getTableSchema(
 ): Promise<string> {
 	return await queueSqliteWorkerRequest<string>(
 		{ type: "getTableSchema", path: sqlitePath, table },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1050,7 +1102,7 @@ export async function resolveTableRowLookup(
 ): Promise<SqliteRowLookup> {
 	return await queueSqliteWorkerRequest<SqliteRowLookup>(
 		{ type: "resolveTableRowLookup", path: sqlitePath, table },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1062,7 +1114,7 @@ export async function queryRows(
 ): Promise<{ columns: string[]; rows: Record<string, unknown>[]; totalCount: number }> {
 	return await queueSqliteWorkerRequest<{ columns: string[]; rows: Record<string, unknown>[]; totalCount: number }>(
 		{ type: "queryRows", path: sqlitePath, table, opts },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1075,7 +1127,7 @@ export async function getRowByKey(
 ): Promise<Record<string, unknown> | null> {
 	return await queueSqliteWorkerRequest<Record<string, unknown> | null>(
 		{ type: "getRowByKey", path: sqlitePath, table, lookup: pk, key },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1087,7 +1139,7 @@ export async function getRowByRowId(
 ): Promise<Record<string, unknown> | null> {
 	return await queueSqliteWorkerRequest<Record<string, unknown> | null>(
 		{ type: "getRowByRowId", path: sqlitePath, table, key },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1098,7 +1150,7 @@ export async function executeReadQuery(
 ): Promise<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }> {
 	return await queueSqliteWorkerRequest<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>(
 		{ type: "executeReadQuery", path: sqlitePath, sql },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1110,7 +1162,7 @@ export async function insertRow(
 ): Promise<void> {
 	await queueSqliteWorkerRequest<void>(
 		{ type: "insertRow", path: sqlitePath, table, data },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1124,7 +1176,7 @@ export async function updateRowByKey(
 ): Promise<number> {
 	return await queueSqliteWorkerRequest<number>(
 		{ type: "updateRowByKey", path: sqlitePath, table, lookup: pk, key, data },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1137,7 +1189,7 @@ export async function updateRowByRowId(
 ): Promise<number> {
 	return await queueSqliteWorkerRequest<number>(
 		{ type: "updateRowByRowId", path: sqlitePath, table, key, data },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1150,7 +1202,7 @@ export async function deleteRowByKey(
 ): Promise<number> {
 	return await queueSqliteWorkerRequest<number>(
 		{ type: "deleteRowByKey", path: sqlitePath, table, lookup: pk, key },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 
@@ -1162,7 +1214,7 @@ export async function deleteRowByRowId(
 ): Promise<number> {
 	return await queueSqliteWorkerRequest<number>(
 		{ type: "deleteRowByRowId", path: sqlitePath, table, key },
-		normalizeSqliteTimeout(options),
+		options,
 	);
 }
 

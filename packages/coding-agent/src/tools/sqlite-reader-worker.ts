@@ -27,6 +27,26 @@ function openDatabase(path: string, writable: boolean): Database {
 		? new Database(path, { create: false, strict: true })
 		: new Database(path, { readonly: true, strict: true });
 	db.run("PRAGMA busy_timeout = 3000");
+	if (writable) {
+		// ponytail: WAL is enabled unconditionally — NOT gated to daemon mode —
+		// deliberately. The root cause (#BLOCKER-8) is this reader/writer pool
+		// dispatching reads and writes to two concurrent worker threads against
+		// the same file (SQLITE_WORKER_POOL_MAX=2 in sqlite-reader.ts), which
+		// applies to every mode, not just the shared-host daemon: a standalone
+		// single-process session already fires concurrent read+write requests
+		// (e.g. a background stats write racing a history read) onto this same
+		// pool. Gating WAL to daemon-only would leave standalone sessions
+		// exposed to the identical SQLITE_BUSY race this fix closes. WAL is the
+		// standard, safe SQLite mode for concurrent multi-connection read+write
+		// on one file and is transparent to any other reader (sqlite3 CLI,
+		// another bun:sqlite handle) that opens the same path.
+		// Trade-off, stated explicitly per review: this is NOT a no-op for
+		// non-daemon usage — it changes the on-disk journal_mode (adds -wal/-shm
+		// sidecar files, sticky until explicitly reset) for every mode that
+		// writes through this worker. Accepted because the alternative (leaving
+		// single-process mode with the same SQLITE_BUSY exposure) is worse.
+		db.run("PRAGMA journal_mode = WAL");
+	}
 	return db;
 }
 

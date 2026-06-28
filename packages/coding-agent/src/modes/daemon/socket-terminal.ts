@@ -35,6 +35,8 @@ export const FRAME_RESUME = 4;
 const HEADER_BYTES = 5;
 /** Cap on input buffered before `start()` attaches the handler (see `#pendingInput`). */
 const MAX_PENDING_INPUT_BYTES = 256 * 1024;
+/** Max frame payload bytes; reject and close socket if a frame header claims more. */
+const MAX_FRAME_BYTES = 8 * 1024 * 1024; // 8 MB
 
 /** Encode a client→host frame. Used by the thin client. */
 export function encodeFrame(type: number, payload: Buffer): Buffer {
@@ -122,6 +124,10 @@ export class SocketTerminal implements Terminal {
 		while (this.#buf.length >= HEADER_BYTES) {
 			const type = this.#buf[0];
 			const len = this.#buf.readUInt32BE(1);
+			if (len > MAX_FRAME_BYTES) {
+				this.#socket.destroy();
+				return;
+			}
 			if (this.#buf.length < HEADER_BYTES + len) break;
 			const payload = this.#buf.subarray(HEADER_BYTES, HEADER_BYTES + len);
 			this.#buf = this.#buf.subarray(HEADER_BYTES + len);

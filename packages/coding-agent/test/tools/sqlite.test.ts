@@ -9,6 +9,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import {
 	executeReadQuery,
+	insertRow,
 	listTables,
 	parseSqlitePathCandidates,
 	parseSqliteSelector,
@@ -479,6 +480,27 @@ describe("SQLite tool support", () => {
 			}),
 		).rejects.toThrow(/no column named 'bogus'/i);
 	});
+
+	// BLOCKER #8: reads and writes against the same file are dispatched to a
+	// 2-slot worker-thread pool (SQLITE_WORKER_POOL_MAX in sqlite-reader.ts) —
+	// a read landing on one worker thread while a write is in-flight on the
+	// other, against the same on-disk file, is exactly the condition that
+	// throws SQLITE_BUSY without WAL. Fires 20 concurrent read+write pairs
+	// against a fresh copy so at least one genuinely overlaps in the pool.
+	it("BLOCKER #8: concurrent read + write against the same DB does not throw SQLITE_BUSY", async () => {
+		const dbPath = await stampFreshDb("write-concurrent.sqlite");
+
+		const ops: Promise<unknown>[] = [];
+		for (let i = 0; i < 20; i++) {
+			ops.push(executeReadQuery(dbPath, "SELECT COUNT(*) AS count FROM users"));
+			ops.push(insertRow(dbPath, "notes", { body: `concurrent note ${i}` }));
+		}
+
+		await expect(Promise.all(ops)).resolves.toBeDefined();
+
+		const finalCount = await executeReadQuery(dbPath, "SELECT COUNT(*) AS count FROM notes");
+		expect(finalCount.rows[0]?.count).toBe(3 + 20);
+	});
 });
 
 describe("SQLite table listing row counts", () => {
@@ -550,3 +572,90 @@ describe("SQLite table listing row counts", () => {
 		expect(renderTableList(await listTables(basePath, { probeCap: 100 }))).toContain("big (10 rows)");
 	});
 });
+describe("SQLite worker-pool robustness", () => {
+	let tmpDir: string;
+	let dbPath: string;
+
+	beforeAll(async () => {
+		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sqlite-pool-"));
+		dbPath = path.join(tmpDir, "pool-test.sqlite");
+		const db = new Database(":memory:");
+		try {
+			db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)");
+			const stmt = db.prepare("INSERT INTO t (v) VALUES (?)");
+			for (let i = 0; i < 5; i++) stmt.run(`row-${i}`);
+			await fs.writeFile(dbPath, db.serialize());
+		} finally {
+			db.close();
+		}
+	});
+
+	afterAll(async () => {
+		await removeWithRetries(tmpDir);
+	});
+
+	it("Fix A: worker slot recycled after error; subsequent requests succeed", async () => {
+		// Warm the pool so a slot exists.
+		await expect(listTables(dbPath)).resolves.toBeDefined();
+
+		// Force a worker error by sending a raw query that causes a
+		// structured-clone failure (the worker tries to postMessage a
+		// function, which can't be cloned).
+		//
+		// Actually, the simplest way to trigger the recycling is to
+		// time out a request (same codepath as messageerror/close).
+		const slowSql = `
+			WITH RECURSIVE spin(n) AS (
+				SELECT 1 UNION ALL SELECT n + 1 FROM spin WHERE n < 100000000
+			)
+			SELECT COUNT(*) AS count FROM spin
+		`;
+		await expect(executeReadQuery(dbPath, slowSql, { timeoutMs: 1 })).rejects.toThrow(/timed out/i);
+
+		// The slot should be recycled. Verify by sending a normal request.
+		const tables = await listTables(dbPath);
+		expect(tables.length).toBeGreaterThan(0);
+	});
+
+	it("Fix B: aborting a queued read rejects promptly and frees the slot", async () => {
+		// Warm the pool.
+		await expect(listTables(dbPath)).resolves.toBeDefined();
+
+		const controller = new AbortController();
+		// Abort immediately — the request should still be queued.
+		controller.abort();
+
+		await expect(
+			executeReadQuery(dbPath, "SELECT 1 AS n", { signal: controller.signal }),
+		).rejects.toThrow(/aborted/i);
+
+		// Verify the slot is still usable.
+		const tables = await listTables(dbPath);
+		expect(tables.length).toBeGreaterThan(0);
+	});
+
+	it("Fix B: aborting a running read terminates worker and frees the slot", async () => {
+		// Warm the pool.
+		await expect(listTables(dbPath)).resolves.toBeDefined();
+
+		const controller = new AbortController();
+		const slowSql = `
+			WITH RECURSIVE spin(n) AS (
+				SELECT 1 UNION ALL SELECT n + 1 FROM spin WHERE n < 100000000
+			)
+			SELECT COUNT(*) AS count FROM spin
+		`;
+		// Start a slow query. Since the pool is warm, it will be dispatched
+		// immediately (state = "running") rather than queued.
+		const slowPromise = executeReadQuery(dbPath, slowSql, { signal: controller.signal, timeoutMs: 60_000 });
+		// Abort without waiting — the query is dispatched synchronously.
+		controller.abort();
+
+		await expect(slowPromise).rejects.toThrow(/aborted/i);
+
+		// Verify the slot is recycled: a new request should succeed.
+		const tables = await listTables(dbPath);
+		expect(tables.length).toBeGreaterThan(0);
+	});
+});
+

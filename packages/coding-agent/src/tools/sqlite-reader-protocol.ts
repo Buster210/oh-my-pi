@@ -2,6 +2,7 @@ export const SQLITE_READER_WORKER_ARG = "__omp_worker_sqlite_reader";
 
 export interface SqliteWorkerCallOptions {
 	timeoutMs?: number;
+	signal?: AbortSignal;
 }
 
 export type SqliteWorkerRequestBase =
