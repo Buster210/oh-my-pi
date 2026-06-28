@@ -209,7 +209,7 @@ test("write backpressure queues data and flushes on drain event", async () => {
 	// First write returns false - should set waiting flag and wait for drain
 	terminal.write("first");
 	expect(writes).toEqual(["first"]);
-	expect(events["drain"]).toBeDefined();
+	expect(events.drain).toBeDefined();
 
 	// Second write while waiting - should queue without attempting write
 	terminal.write("second");
@@ -221,7 +221,7 @@ test("write backpressure queues data and flushes on drain event", async () => {
 
 	// Emit drain - should flush queue in order
 	drainEmitted = true;
-	const drainCb = events["drain"]![0];
+	const drainCb = events.drain![0];
 	drainCb();
 	await Bun.sleep(10);
 
@@ -262,7 +262,7 @@ test("write backpressure clears queue when socket becomes unwritable", async () 
 	mockSocket.writable = false;
 
 	// Emit drain - should clear queue without error
-	events["drain"]![0]();
+	events.drain![0]();
 	await Bun.sleep(10);
 
 	// No more writes after socket became unwritable

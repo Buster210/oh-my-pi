@@ -18,8 +18,8 @@ import {
 	getCurrentThemeName,
 	getThemeByName,
 	setAutoThemeMapping,
-	setThemeInstance,
 	setTheme,
+	setThemeInstance,
 	theme,
 } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";

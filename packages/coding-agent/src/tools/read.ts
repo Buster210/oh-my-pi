@@ -1856,7 +1856,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		try {
 			switch (selector.kind) {
 				case "list": {
-					const listLimit = applyListLimit(await listTables(resolvedSqlitePath.absolutePath, { signal }), { limit: 500 });
+					const listLimit = applyListLimit(await listTables(resolvedSqlitePath.absolutePath, { signal }), {
+						limit: 500,
+					});
 					const output = prependSuffixResolutionNotice(
 						renderTableList(listLimit.items),
 						resolvedSqlitePath.suffixResolution,
@@ -1873,14 +1875,22 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					return resultBuilder.done();
 				}
 				case "schema": {
-					const sampleRows = await queryRows(resolvedSqlitePath.absolutePath, selector.table, {
-						limit: selector.sampleLimit,
-						offset: 0,
-					}, { signal });
-					let output = renderSchema(await getTableSchema(resolvedSqlitePath.absolutePath, selector.table, { signal }), {
-						columns: sampleRows.columns,
-						rows: sampleRows.rows,
-					});
+					const sampleRows = await queryRows(
+						resolvedSqlitePath.absolutePath,
+						selector.table,
+						{
+							limit: selector.sampleLimit,
+							offset: 0,
+						},
+						{ signal },
+					);
+					let output = renderSchema(
+						await getTableSchema(resolvedSqlitePath.absolutePath, selector.table, { signal }),
+						{
+							columns: sampleRows.columns,
+							rows: sampleRows.rows,
+						},
+					);
 					if (sampleRows.rows.length < sampleRows.totalCount) {
 						const remaining = sampleRows.totalCount - sampleRows.rows.length;
 						output += `\n[${remaining} more rows; append :${selector.table}?limit=20&offset=${sampleRows.rows.length} to the database path to continue]`;
@@ -1894,7 +1904,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const lookup = await resolveTableRowLookup(resolvedSqlitePath.absolutePath, selector.table, { signal });
 					const row =
 						lookup.kind === "pk"
-							? await getRowByKey(resolvedSqlitePath.absolutePath, selector.table, lookup, selector.key, { signal })
+							? await getRowByKey(resolvedSqlitePath.absolutePath, selector.table, lookup, selector.key, {
+									signal,
+								})
 							: await getRowByRowId(resolvedSqlitePath.absolutePath, selector.table, selector.key, { signal });
 					if (!row) {
 						return toolResult<ReadToolDetails>(details)

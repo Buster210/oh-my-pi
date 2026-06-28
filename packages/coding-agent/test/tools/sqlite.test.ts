@@ -8,6 +8,7 @@ import "@oh-my-pi/pi-coding-agent/tools/renderers";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import {
+	__sqliteWorkerPoolForTests,
 	executeReadQuery,
 	insertRow,
 	listTables,
@@ -594,16 +595,10 @@ describe("SQLite worker-pool robustness", () => {
 		await removeWithRetries(tmpDir);
 	});
 
-	it("Fix A: worker slot recycled after error; subsequent requests succeed", async () => {
-		// Warm the pool so a slot exists.
+	it("Fix A (timeout path): a timed-out request recycles its slot; later requests succeed", async () => {
 		await expect(listTables(dbPath)).resolves.toBeDefined();
 
-		// Force a worker error by sending a raw query that causes a
-		// structured-clone failure (the worker tries to postMessage a
-		// function, which can't be cloned).
-		//
-		// Actually, the simplest way to trigger the recycling is to
-		// time out a request (same codepath as messageerror/close).
+		// Timeout recycle path — distinct from the close/messageerror handlers below.
 		const slowSql = `
 			WITH RECURSIVE spin(n) AS (
 				SELECT 1 UNION ALL SELECT n + 1 FROM spin WHERE n < 100000000
@@ -612,22 +607,43 @@ describe("SQLite worker-pool robustness", () => {
 		`;
 		await expect(executeReadQuery(dbPath, slowSql, { timeoutMs: 1 })).rejects.toThrow(/timed out/i);
 
-		// The slot should be recycled. Verify by sending a normal request.
+		const tables = await listTables(dbPath);
+		expect(tables.length).toBeGreaterThan(0);
+	});
+
+	it("Fix A (close path): a worker 'close' event recycles the slot and rejects the in-flight request", async () => {
+		await expect(listTables(dbPath)).resolves.toBeDefined();
+		const slot = __sqliteWorkerPoolForTests[0];
+		expect(slot).toBeDefined();
+
+		// Slow query keeps the slot busy; long timeout prevents the timeout path from firing first.
+		const slowSql = `
+			WITH RECURSIVE spin(n) AS (
+				SELECT 1 UNION ALL SELECT n + 1 FROM spin WHERE n < 100000000
+			)
+			SELECT COUNT(*) AS count FROM spin
+		`;
+		const inFlight = executeReadQuery(dbPath, slowSql, { timeoutMs: 60_000 });
+
+		// Simulate Bun's worker "close" event — the codepath timeout/abort tests never touch.
+		slot.worker.dispatchEvent(new Event("close"));
+
+		await expect(inFlight).rejects.toThrow(/closed unexpectedly/i);
+		expect(__sqliteWorkerPoolForTests.includes(slot)).toBe(false);
+
 		const tables = await listTables(dbPath);
 		expect(tables.length).toBeGreaterThan(0);
 	});
 
 	it("Fix B: aborting a queued read rejects promptly and frees the slot", async () => {
-		// Warm the pool.
 		await expect(listTables(dbPath)).resolves.toBeDefined();
 
 		const controller = new AbortController();
-		// Abort immediately — the request should still be queued.
 		controller.abort();
 
-		await expect(
-			executeReadQuery(dbPath, "SELECT 1 AS n", { signal: controller.signal }),
-		).rejects.toThrow(/aborted/i);
+		await expect(executeReadQuery(dbPath, "SELECT 1 AS n", { signal: controller.signal })).rejects.toThrow(
+			/aborted/i,
+		);
 
 		// Verify the slot is still usable.
 		const tables = await listTables(dbPath);
@@ -658,4 +674,3 @@ describe("SQLite worker-pool robustness", () => {
 		expect(tables.length).toBeGreaterThan(0);
 	});
 });
-
