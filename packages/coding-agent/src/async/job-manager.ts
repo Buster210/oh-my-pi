@@ -1,4 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import { getSessionScope } from "../modes/daemon/session-scope";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -98,11 +99,15 @@ export class AsyncJobManager {
 
 	/** Process-global instance shared by internal URL protocol handlers and tools. */
 	static instance(): AsyncJobManager | undefined {
-		return AsyncJobManager.#instance;
+		return getSessionScope()?.asyncJobManager ?? AsyncJobManager.#instance;
 	}
 
-	/** Install or clear the process-global instance. */
 	static setInstance(value: AsyncJobManager | undefined): void {
+		const scope = getSessionScope();
+		if (scope) {
+			scope.asyncJobManager = value;
+			return;
+		}
 		AsyncJobManager.#instance = value;
 	}
 

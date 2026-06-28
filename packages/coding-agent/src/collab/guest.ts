@@ -37,6 +37,7 @@ import {
 	parseCollabLink,
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
+import type { ICollabSocket } from "./types";
 
 /** Commands a guest may run locally; everything else is host-only. */
 export const COLLAB_GUEST_ALLOWED_COMMANDS: Record<string, true> = {
@@ -124,7 +125,7 @@ export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconc
 
 export class CollabGuestLink {
 	#ctx: InteractiveModeContext;
-	#socket: CollabSocket | null = null;
+	#socket: ICollabSocket | null = null;
 	#roomId = "";
 	/** Previous session file to restore on leave; null = previous session was unsaved. */
 	#returnSessionFile: string | null = null;
@@ -286,7 +287,7 @@ export class CollabGuestLink {
 						return;
 					}
 					if (!this.#welcomed || this.#left) return;
-					this.#applyFrame(frame);
+					await this.#applyFrame(frame);
 				})
 				.catch(err => {
 					logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
@@ -462,7 +463,7 @@ export class CollabGuestLink {
 		}
 	}
 
-	#applyFrame(frame: CollabFrame): void {
+	async #applyFrame(frame: CollabFrame): Promise<void> {
 		switch (frame.t) {
 			case "entry": {
 				// Entries are never rendered directly — rendering is events-only

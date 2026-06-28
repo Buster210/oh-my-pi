@@ -1,5 +1,9 @@
 import { encodeSixel } from "@oh-my-pi/pi-natives";
 import { $env, isBunTestRuntime, isTerminalHeadless } from "@oh-my-pi/pi-utils";
+// Relative path is deliberate: must resolve to the SAME module instance as the
+// setter (packages/coding-agent) so the per-session ALS flag propagates; the
+// installed node_modules pi-utils copy does not contain this module.
+import { isNotificationsSuppressedBySession } from "../../../packages/utils/src/notification-suppression";
 import { sendDesktopNotification, shouldDeliverDesktopNotification } from "./desktop-notify";
 import {
 	detectKittyUnicodePlaceholdersSupport,
@@ -189,6 +193,7 @@ export function wrapTmuxPassthrough(payload: string): string {
 }
 
 export function isNotificationSuppressed(): boolean {
+	if (isNotificationsSuppressedBySession()) return true;
 	const value = $env.PI_NOTIFICATIONS;
 	if (!value) return false;
 	return value === "off" || value === "0" || value === "false";

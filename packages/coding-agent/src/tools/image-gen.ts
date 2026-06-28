@@ -26,6 +26,7 @@ import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
 import { settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { ohMyPiXAIUserAgent, resolveXAIHttpCredentials } from "../lib/xai-http";
+import { getSessionScope } from "../modes/daemon/session-scope";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { resolveReadPath } from "./path-utils";
 
@@ -441,7 +442,16 @@ export function isImageProviderPreference(value: unknown): value is ImageProvide
 
 /** Set the preferred image provider from settings */
 export function setPreferredImageProvider(provider: ImageProviderPreference): void {
+	const scope = getSessionScope();
+	if (scope) {
+		scope.preferredImageProvider = provider;
+		return;
+	}
 	preferredImageProvider = provider;
+}
+
+function getPreferredImageProvider(): ImageProviderPreference {
+	return getSessionScope()?.preferredImageProvider ?? preferredImageProvider;
 }
 function assertImageAspectRatioSupported(provider: ImageProvider, aspectRatio: ImageGenParams["aspect_ratio"]): void {
 	if (!aspectRatio || provider === "xai" || COMMON_IMAGE_ASPECT_RATIO_SET.has(aspectRatio)) {
@@ -553,23 +563,24 @@ async function findImageApiKey(
 	sessionId?: string,
 ): Promise<ImageApiKey | null> {
 	// If a specific provider is preferred, try it first.
-	if (preferredImageProvider === "openai") {
+	const preferred = getPreferredImageProvider();
+	if (preferred === "openai") {
 		const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
 		if (openAI) return openAI;
 		// Fall through to auto-detect if preferred provider key not found.
-	} else if (preferredImageProvider === "antigravity" && modelRegistry) {
+	} else if (preferred === "antigravity" && modelRegistry) {
 		const antigravity = await findAntigravityCredentials(modelRegistry, sessionId);
 		if (antigravity) return antigravity;
 		// Fall through to auto-detect if preferred provider key not found.
-	} else if (preferredImageProvider === "gemini") {
+	} else if (preferred === "gemini") {
 		const gemini = await findGeminiImageCredentials(modelRegistry, sessionId);
 		if (gemini) return gemini;
 		// Fall through to auto-detect if preferred provider key not found.
-	} else if (preferredImageProvider === "openrouter") {
+	} else if (preferred === "openrouter") {
 		const openRouter = await findOpenRouterImageCredentials(modelRegistry, sessionId);
 		if (openRouter) return openRouter;
 		// Fall through to auto-detect if preferred provider key not found.
-	} else if (preferredImageProvider === "xai") {
+	} else if (preferred === "xai") {
 		const xai = await findXAIImageCredentials(modelRegistry);
 		if (xai) return xai;
 		// Fall through to auto-detect if preferred provider key not found.

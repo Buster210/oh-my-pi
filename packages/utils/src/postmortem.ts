@@ -9,7 +9,6 @@ import inspector from "node:inspector";
 import { isMainThread } from "node:worker_threads";
 import { logger } from ".";
 
-// Cleanup reasons, in order of priority/meaning.
 export enum Reason {
 	PRE_EXIT = "pre_exit", // Pre-exit phase (not used by default)
 	EXIT = "exit", // Normal process exit
@@ -21,11 +20,39 @@ export enum Reason {
 	MANUAL = "manual", // Manual cleanup (not triggered by process)
 }
 
-// Internal list of active cleanup callbacks (in registration order)
 const callbackList: ((reason: Reason) => Promise<void> | void)[] = [];
 // Tracks cleanup run state (to prevent recursion/reentry issues)
 let cleanupStage: "idle" | "running" | "complete" = "idle";
 const CLEANUP_DEADLINE_MS = 10_000;
+
+// When active, uncaught exceptions / unhandled rejections are logged but NOT
+// passed to cleanup callbacks and the process does NOT exit.  This prevents
+// one session's crash from tearing down all sessions.  Signals route through
+// a single daemon-registered shutdown callback instead of the built-in exit paths.
+let containMode = false;
+let daemonShutdownHandler: ((reason: Reason) => Promise<void> | void) | undefined;
+
+/**
+ * Switch postmortem into "contain" mode (for the shared daemon host).
+ * In contain mode:
+ *   - `uncaughtException` / `unhandledRejection` are logged but NOT passed to cleanup callbacks
+ *     and the process does NOT exit. This prevents one session's crash from tearing down all sessions.
+ *   - `SIGINT` / `SIGTERM` / `SIGHUP` call the daemon-registered shutdown handler (via
+ *     {@link setDaemonShutdown}) instead of running the built-in exit path — the handler owns
+ *     marker writing, socket unlink, and exit.
+ */
+export function contain(): void {
+	containMode = true;
+}
+
+/**
+ * Register the daemon's single coherent shutdown path.  When a signal arrives
+ * in contain mode, postmortem calls this callback instead of its own
+ * exit-based shutdown — so there is exactly one handler, no races.
+ */
+export function setDaemonShutdown(handler: (reason: Reason) => Promise<void> | void): void {
+	daemonShutdownHandler = handler;
+}
 
 /**
  * Internal: runs all registered cleanup callbacks for the given reason.
@@ -139,6 +166,13 @@ export function interceptUnhandledRejections(interceptor: (reason: unknown) => b
 	return () => rejectionInterceptors.delete(interceptor);
 }
 
+// ponytail: dedupes the "contain mode short-circuit" repeated in SIGINT/SIGTERM/SIGHUP handlers
+function containSignal(reason: Reason): boolean {
+	if (!containMode) return false;
+	daemonShutdownHandler?.(reason);
+	return true;
+}
+
 function formatFatalError(label: string, err: Error): string {
 	const name = err.name || "Error";
 	const message = err.message || "(no message)";
@@ -151,6 +185,7 @@ function formatFatalError(label: string, err: Error): string {
 if (isMainThread) {
 	process
 		.on("SIGINT", async () => {
+			if (containSignal(Reason.SIGINT)) return;
 			await runCleanup(Reason.SIGINT);
 			process.exit(130); // 128 + SIGINT (2)
 		})
@@ -168,6 +203,9 @@ if (isMainThread) {
 			}
 			process.stderr.write(formatFatalError("Uncaught Exception", err));
 			logger.error("Uncaught exception", { err });
+			// In contain mode, just log and keep the daemon alive (no cleanup callbacks, no exit).
+			// This prevents one session's crash from tearing down all sessions in the shared host.
+			if (containMode) return;
 			await runCleanup(Reason.UNCAUGHT_EXCEPTION);
 			process.exit(1);
 		})
@@ -201,6 +239,9 @@ if (isMainThread) {
 			}
 			process.stderr.write(formatFatalError("Unhandled Rejection", err));
 			logger.error("Unhandled rejection", { err });
+			// In contain mode, just log and keep the daemon alive (no cleanup callbacks, no exit).
+			// This prevents one session's crash from tearing down all sessions in the shared host.
+			if (containMode) return;
 			await runCleanup(Reason.UNHANDLED_REJECTION);
 			process.exit(1);
 		})
@@ -208,10 +249,12 @@ if (isMainThread) {
 			void runCleanup(Reason.EXIT); // fire and forget (exit imminent)
 		})
 		.on("SIGTERM", async () => {
+			if (containSignal(Reason.SIGTERM)) return;
 			await runCleanup(Reason.SIGTERM);
 			process.exit(143); // 128 + SIGTERM (15)
 		})
 		.on("SIGHUP", async () => {
+			if (containSignal(Reason.SIGHUP)) return;
 			await runCleanup(Reason.SIGHUP);
 			process.exit(129); // 128 + SIGHUP (1)
 		});

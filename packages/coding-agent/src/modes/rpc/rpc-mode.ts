@@ -512,21 +512,38 @@ export function requestRpcEditor(
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
+/**
+ * I/O seam for runRpcMode. Omitted → standalone stdin/stdout + process.exit
+ * (byte-identical to the historical `--mode rpc`/`--mode rpc-ui` behavior).
+ * A daemon host passes a per-connection socket duplex + a teardown that lets
+ * the shared host process survive one client disconnecting.
+ */
+export interface RpcModeIO {
+	/** Input stream (defaults to Bun.stdin.stream()). */
+	input?: ReadableStream<Uint8Array>;
+	/** Line writer (defaults to process.stdout.write). */
+	output?: (data: string) => void;
+	/** Called instead of process.exit(0) on client disconnect/shutdown. Must be
+	 *  idempotent — it can fire on both the shutdown path and the loop-end path. */
+	onExit?: () => void;
+}
+
 export async function runRpcMode(
 	session: AgentSession,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
-): Promise<never> {
-	// Signal to RPC clients that the server is ready to accept commands
-	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
-	// process.stdout with no newline, which the reader merges with the next JSON line and
-	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
-	// may write there.
-	process.env.PI_NOTIFICATIONS = "off";
+	io?: RpcModeIO,
+): Promise<void> {
+	// Signal to RPC clients that the server is ready to accept commands.
+	// Terminal notifications are suppressed by the caller via
+	// runWithNotificationsSuppressed() — not by mutating process.env, which
+	// would leak across concurrent sessions in a shared-host daemon.
 
-	process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
+	const write = io?.output ?? ((data: string) => void process.stdout.write(data));
+	const exit = () => (io?.onExit ? io.onExit() : process.exit(0));
+	write(`${JSON.stringify({ type: "ready" })}\n`);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(`${JSON.stringify(obj)}\n`);
+		write(`${JSON.stringify(obj)}\n`);
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -1256,7 +1273,7 @@ export async function runRpcMode(
 			if (session.extensionRunner?.hasHandlers("session_shutdown")) {
 				await session.extensionRunner.emit({ type: "session_shutdown" });
 			}
-			process.exit(0);
+			exit();
 		},
 	});
 
@@ -1271,10 +1288,9 @@ export async function runRpcMode(
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
 	};
 
-	// Listen for JSON input using Bun's stdin. Frame dispatch lives in
-	// dispatchRpcInputFrame so it can be exercised directly by tests; see the
-	// helper's docstring for the concurrency contract.
-	for await (const parsed of readJsonl(Bun.stdin.stream())) {
+	// Listen for JSON input using Bun's stdin
+	const inputStream = io?.input ?? Bun.stdin.stream();
+	for await (const parsed of readJsonl(inputStream)) {
 		try {
 			const awaited = dispatchRpcInputFrame(parsed, dispatchFrameDeps);
 			if (awaited) {
@@ -1301,5 +1317,5 @@ export async function runRpcMode(
 	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	subagentRegistry?.dispose();
-	process.exit(0);
+	exit();
 }

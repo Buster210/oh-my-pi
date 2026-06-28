@@ -169,6 +169,9 @@ export class InputController {
 			readText: readTextFromClipboard,
 			readMacFileUrls: readMacFileUrlsFromClipboard,
 		},
+		/** Called instead of process.exit when running under an injected terminal (daemon).
+		 *  Ends only this connection, never the shared host process. */
+		private onExit?: () => void,
 	) {}
 
 	#enhancedPaste?: EnhancedPasteController;
@@ -1005,6 +1008,13 @@ export class InputController {
 		// common case; this is the defense-in-depth ladder for everything
 		// else. See issue #2600.
 		if (this.ctx.isShuttingDown) {
+			// onExit ends only this connection (daemon); process.exit would kill
+			// the shared host and every other session. `?.() ??` won't do — a void
+			// onExit returns undefined and would still fall through to exit.
+			if (this.onExit) {
+				this.onExit();
+				return;
+			}
 			process.exit(130); // 128 + SIGINT
 		}
 
@@ -1033,6 +1043,7 @@ export class InputController {
 			this.ctx.showStatus("Suspend (Ctrl+Z) is not supported on this platform");
 			return;
 		}
+		if (this.onExit) return;
 
 		// Capture the listener so we can detach it if the signal never fires;
 		// otherwise a failed suspend would leave a stale SIGCONT handler that

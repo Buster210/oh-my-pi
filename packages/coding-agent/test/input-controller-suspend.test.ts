@@ -64,6 +64,26 @@ describe("InputController.handleCtrlZ", () => {
 		expect(showError).not.toHaveBeenCalled();
 	});
 
+	it("does not suspend the shared daemon when an injected exit seam is present", () => {
+		setPlatform("linux");
+		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+		const onceSpy = vi.spyOn(process, "once");
+		const onExit = vi.fn();
+		const { ctx, ui, showStatus, showError } = createCtx();
+
+		const controller = new InputController(ctx, undefined, onExit);
+		expect(() => controller.handleCtrlZ()).not.toThrow();
+
+		expect(onExit).not.toHaveBeenCalled();
+		expect(killSpy).not.toHaveBeenCalled();
+		expect(onceSpy).not.toHaveBeenCalled();
+		expect(ui.stop).not.toHaveBeenCalled();
+		expect(ui.start).not.toHaveBeenCalled();
+		expect(ui.requestRender).not.toHaveBeenCalled();
+		expect(showStatus).not.toHaveBeenCalled();
+		expect(showError).not.toHaveBeenCalled();
+	});
+
 	it("SIGSTOPs the foreground process group and registers a SIGCONT resume hook on POSIX (#3461)", () => {
 		setPlatform("linux");
 		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);

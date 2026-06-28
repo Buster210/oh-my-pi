@@ -1086,7 +1086,14 @@ export class EventController {
 			this.ctx.statusContainer.disposeChildren();
 		}
 		if (this.ctx.streamingComponent) {
-			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
+			// message_end should have removed this, but if it failed before
+			// updateContent(), the component has partial content and must stay
+			// visible rather than vanishing from the transcript.
+			if (this.ctx.streamingMessage) {
+				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+			}
+			this.ctx.streamingComponent.markTranscriptBlockFinalized();
+			this.#lastAssistantComponent = this.ctx.streamingComponent;
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
 		}

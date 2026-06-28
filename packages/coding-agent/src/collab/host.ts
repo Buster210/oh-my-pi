@@ -45,6 +45,7 @@ import {
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
 import { shrinkForReplication } from "./replication-shrink";
+import type { ICollabSocket } from "./types";
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -120,7 +121,7 @@ export type CollabGuestUiResult = { kind: "answered"; value: CollabUiResponseVal
 
 export class CollabHost {
 	#ctx: InteractiveModeContext;
-	#socket: CollabSocket | null = null;
+	#socket: ICollabSocket | null = null;
 	#link = "";
 	#webLink = "";
 	#viewLink = "";
@@ -219,8 +220,7 @@ export class CollabHost {
 		const parsed = parseCollabLink(this.#link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		const key = await importRoomKey(rawKey);
-
-		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key });
+		const socket: ICollabSocket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key });
 		this.#socket = socket;
 		this.#sessionId = this.#ctx.sessionManager.getSessionId();
 

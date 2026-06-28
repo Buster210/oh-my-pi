@@ -254,7 +254,12 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 }
 
 type LateDiagnosticsDetails = {
-	files: Array<{ path: string; summary: string; errored: boolean; messages: string[] }>;
+	files: Array<{
+		path: string;
+		summary: string;
+		errored: boolean;
+		messages: string[];
+	}>;
 };
 
 function buildLateDiagnosticsBatchMessage(
@@ -611,14 +616,30 @@ export function resolveDialect(
 
 export type { PromptTemplate } from "./config/prompt-templates";
 export { Settings, type SkillsSettings } from "./config/settings";
-export type { CustomCommand, CustomCommandFactory } from "./extensibility/custom-commands/types";
-export type { CustomTool, CustomToolFactory } from "./extensibility/custom-tools/types";
+export type {
+	CustomCommand,
+	CustomCommandFactory,
+} from "./extensibility/custom-commands/types";
+export type {
+	CustomTool,
+	CustomToolFactory,
+} from "./extensibility/custom-tools/types";
 export type * from "./extensibility/extensions";
 export type { Skill } from "./extensibility/skills";
 export type { FileSlashCommand } from "./extensibility/slash-commands";
-export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResult } from "./mcp";
+export type {
+	MCPManager,
+	MCPServerConfig,
+	MCPServerConnection,
+	MCPToolsLoadResult,
+} from "./mcp";
 export type { Tool } from "./tools";
-export { buildDirectoryTree, buildWorkspaceTree, type DirectoryTree, type WorkspaceTree } from "./workspace-tree";
+export {
+	buildDirectoryTree,
+	buildWorkspaceTree,
+	type DirectoryTree,
+	type WorkspaceTree,
+} from "./workspace-tree";
 
 export {
 	// Individual tool classes (for custom usage)
@@ -920,7 +941,11 @@ function customToolToDefinition(tool: CustomTool): ToolDefinition {
 			? (result, options, theme): Component => {
 					const component = tool.renderResult?.(
 						result,
-						{ expanded: options.expanded, isPartial: options.isPartial, spinnerFrame: options.spinnerFrame },
+						{
+							expanded: options.expanded,
+							isPartial: options.isPartial,
+							spinnerFrame: options.spinnerFrame,
+						},
 						theme,
 					);
 					// Return empty component if undefined to match Component type requirement
@@ -944,7 +969,10 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 				try {
 					await tool.onSession(event, createCustomToolContext(ctx));
 				} catch (err) {
-					logger.warn("Custom tool onSession error", { tool: tool.name, error: String(err) });
+					logger.warn("Custom tool onSession error", {
+						tool: tool.name,
+						error: String(err),
+					});
 				}
 			}
 		};
@@ -965,7 +993,14 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 			runOnSession({ reason: "shutdown", previousSessionFile: undefined }, ctx),
 		);
 		api.on("auto_compaction_start", async (event, ctx) =>
-			runOnSession({ reason: "auto_compaction_start", trigger: event.reason, action: event.action }, ctx),
+			runOnSession(
+				{
+					reason: "auto_compaction_start",
+					trigger: event.reason,
+					action: event.action,
+				},
+				ctx,
+			),
 		);
 		api.on("auto_compaction_end", async (event, ctx) =>
 			runOnSession(
@@ -1157,7 +1192,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		? Promise.resolve(options.workspaceTree)
 		: includeWorkspaceTree
 			? logger.time("buildWorkspaceTree", () => buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }))
-			: Promise.resolve({ rootPath: cwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] });
+			: Promise.resolve({
+					rootPath: cwd,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				});
 	workspaceTreePromise.catch(() => {});
 
 	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
@@ -1171,7 +1212,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		try {
 			return await resolveActiveRepoContext(cwd);
 		} catch (err) {
-			logger.debug("Failed to resolve active repo context", { err: String(err) });
+			logger.debug("Failed to resolve active repo context", {
+				err: String(err),
+			});
 			return null;
 		}
 	});
@@ -1403,7 +1446,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (existingSession.injectedTtsrRules.length > 0) {
 				ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
 			}
-			return { ttsrManager, rulebookRules, alwaysApplyRules, allRules: rulesResult.items };
+			return {
+				ttsrManager,
+				rulebookRules,
+				alwaysApplyRules,
+				allRules: rulesResult.items,
+			};
 		},
 	);
 
@@ -1684,6 +1732,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let startDeferredMCPDiscovery:
 			| ((liveSession: AgentSession, activation: DeferredMCPActivation) => void)
 			| undefined;
+		// Lazy deferred discovery reports zero tools up front; the auto-discovery
+		// threshold must be re-evaluated whenever MCP tools actually arrive.
+		// Assigned once the session exists; shared by the one-shot discovery path
+		// and the manager's onToolsChanged late-arrival path.
+		let upgradeDeferredMCPDiscovery: ((mcpToolNames: string[]) => Promise<boolean>) | undefined;
 		const startupQuiet = settings.get("startup.quiet");
 		const onMCPStatus = (event: McpConnectionStatusEvent) => {
 			if (!options.hasUI || startupQuiet) return;
@@ -1714,7 +1767,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					void (async () => {
 						try {
 							const mcpResult = await logger.time("discoverAndLoadMCPTools", () =>
-								deferredMCPManager.discoverAndConnect(mcpDiscoverOptions),
+								deferredMCPManager.discoverAndConnect({
+									...mcpDiscoverOptions,
+									lazy: true,
+								}),
 							);
 							// The session can be torn down while servers are still connecting.
 							// Don't resurrect tools on a disposed session, and don't leak the
@@ -1732,32 +1788,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// the active set with no search_tool_bm25 registered.
 							let discoveryEnabled = activation.mcpDiscoveryEnabled;
 							let activateAll = activation.activateAllMCPTools;
-							if (!discoveryEnabled) {
-								const nonMCPToolNames = [...toolRegistry.keys()].filter(name => !isMCPToolName(name));
-								const projectedMode = resolveEffectiveToolDiscoveryMode(
-									settings,
-									countToolsForAutoDiscovery([...nonMCPToolNames, ...mcpResult.tools.map(tool => tool.name)]),
-								);
-								if (projectedMode !== "off") {
-									effectiveDiscoveryMode = projectedMode;
-									mcpDiscoveryEnabled = true;
-									discoveryEnabled = true;
-									activateAll = false;
-									liveSession.enableMCPDiscovery();
-									if (!toolRegistry.has("search_tool_bm25")) {
-										const searchTool: Tool = new SearchToolBm25Tool(toolSession);
-										toolRegistry.set(
-											searchTool.name,
-											new ExtensionToolWrapper(wrapToolWithMetaNotice(searchTool), extensionRunner) as Tool,
-										);
-									}
-									await liveSession.setActiveToolsByName([
-										...liveSession.getActiveToolNames(),
-										"search_tool_bm25",
-									]);
-								}
+							if (
+								!discoveryEnabled &&
+								(await upgradeDeferredMCPDiscovery?.(mcpResult.tools.map(tool => tool.name)))
+							) {
+								discoveryEnabled = true;
+								activateAll = false;
 							}
-							await liveSession.refreshMCPTools(mcpResult.tools, { activateAll });
+							await liveSession.refreshMCPTools(mcpResult.tools, {
+								activateAll,
+							});
 							if (activation.explicitlyRequestedMCPToolNames.length > 0) {
 								if (discoveryEnabled && !activation.mcpDiscoveryEnabled) {
 									// Discovery flipped on mid-flight: route the explicit request
@@ -2347,7 +2387,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const hasDiscoverableTools =
 				mcpDiscoveryEnabled && toolNames.includes("search_tool_bm25") && discoverableToolsForDesc.length > 0;
 			const promptTools = buildSystemPromptToolMetadata(tools, {
-				search_tool_bm25: { description: renderSearchToolBm25Description(discoverableToolsForDesc) },
+				search_tool_bm25: {
+					description: renderSearchToolBm25Description(discoverableToolsForDesc),
+				},
 			});
 			const memoryBackend = await resolveMemoryBackend(settings);
 			const memoryInstructions = await memoryBackend.buildDeveloperInstructions(agentDir, settings, session);
@@ -2596,7 +2638,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						if (hasImages) {
 							const filteredContent = content
 								.map(c =>
-									c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
+									c.type === "image"
+										? {
+												type: "text" as const,
+												text: "Image reading is disabled.",
+											}
+										: c,
 								)
 								.filter((c, i, arr) => {
 									// Dedupe consecutive "Image reading is disabled." texts
@@ -2998,7 +3045,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						if (!startupQuiet) eventBus.emit(LSP_STARTUP_EVENT_CHANNEL, event);
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
-						logger.warn("LSP server warmup failed", { cwd, error: errorMessage });
+						logger.warn("LSP server warmup failed", {
+							cwd,
+							error: errorMessage,
+						});
 						for (const server of lspServers ?? []) {
 							server.status = "error";
 							server.error = errorMessage;
@@ -3050,20 +3100,52 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Wire MCP manager callbacks to session for reactive tool updates.
 		// Skip when reusing a parent's manager — the parent owns the callbacks.
 		if (mcpManager && !options.mcpManager) {
+			upgradeDeferredMCPDiscovery = async (mcpToolNames: string[]): Promise<boolean> => {
+				if (session.isDisposed || mcpDiscoveryEnabled) return false;
+				const nonMCPToolNames = [...toolRegistry.keys()].filter(name => !isMCPToolName(name));
+				const projectedMode = resolveEffectiveToolDiscoveryMode(
+					settings,
+					countToolsForAutoDiscovery([...nonMCPToolNames, ...mcpToolNames]),
+				);
+				if (projectedMode === "off") return false;
+				effectiveDiscoveryMode = projectedMode;
+				mcpDiscoveryEnabled = true;
+				session.enableMCPDiscovery();
+				if (!toolRegistry.has("search_tool_bm25")) {
+					const searchTool: Tool = new SearchToolBm25Tool(toolSession);
+					toolRegistry.set(
+						searchTool.name,
+						new ExtensionToolWrapper(wrapToolWithMetaNotice(searchTool), extensionRunner) as Tool,
+					);
+				}
+				await session.setActiveToolsByName([...session.getActiveToolNames(), "search_tool_bm25"]);
+				return true;
+			};
 			mcpManager.setOnToolsChanged(tools => {
 				void (async () => {
 					try {
+						let discoveryFlippedNow = false;
+						if (deferMCPDiscoveryForUI) {
+							discoveryFlippedNow = (await upgradeDeferredMCPDiscovery?.(tools.map(tool => tool.name))) ?? false;
+						}
 						await session.refreshMCPTools(
 							tools,
 							deferMCPDiscoveryForUI && !mcpDiscoveryEnabled && options.toolNames === undefined
 								? { activateAll: true }
 								: undefined,
 						);
-						if (deferMCPDiscoveryForUI && !mcpDiscoveryEnabled && explicitlyRequestedMCPToolNames.length > 0) {
-							await session.setActiveToolsByName([
-								...session.getActiveToolNames(),
-								...explicitlyRequestedMCPToolNames,
-							]);
+						if (deferMCPDiscoveryForUI && explicitlyRequestedMCPToolNames.length > 0) {
+							if (discoveryFlippedNow) {
+								// Discovery flipped on during this arrival: route the explicit
+								// request through discovery-aware activation so selection
+								// persists (mirrors the one-shot discovery path).
+								await session.activateDiscoveredMCPTools(explicitlyRequestedMCPToolNames);
+							} else if (!mcpDiscoveryEnabled) {
+								await session.setActiveToolsByName([
+									...session.getActiveToolNames(),
+									...explicitlyRequestedMCPToolNames,
+								]);
+							}
 						}
 					} catch (error) {
 						logger.warn("MCP tool refresh failed", {
@@ -3076,7 +3158,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpManager.setOnPromptsChanged(serverName => {
 				const promptCommands = buildMCPPromptCommands(mcpManager);
 				session.setMCPPromptCommands(promptCommands);
-				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
+				logger.debug("MCP prompt commands refreshed", {
+					path: `mcp:${serverName}`,
+				});
 			});
 			const notificationDebounceTimers = new Map<string, Timer>();
 			const clearDebounceTimers = () => {
@@ -3085,7 +3169,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			};
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
 			mcpManager.setOnResourcesChanged((serverName, uri) => {
-				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
+				logger.debug("MCP resources changed", {
+					path: `mcp:${serverName}`,
+					uri,
+				});
 				if (!settings.get("mcp.notifications")) return;
 				const debounceMs = settings.get("mcp.notificationDebounceMs");
 				const key = `${serverName}:${uri}`;

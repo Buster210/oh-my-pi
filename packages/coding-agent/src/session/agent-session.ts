@@ -3019,6 +3019,15 @@ export class AgentSession {
 		this.#standingResolveHandler = handler ?? undefined;
 	}
 
+	/** Called instead of process.exit(0) by the `shutdown` extension command when set
+	 *  — lets a daemon session end only its own connection, never the shared host.
+	 *  Unset (standalone) falls back to process.exit(0), byte-identical to before. */
+	#onExit: (() => void) | undefined;
+
+	setOnExit(onExit: (() => void) | undefined): void {
+		this.#onExit = onExit;
+	}
+
 	#sessionSwitchReconciler: (() => Promise<void>) | undefined;
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
@@ -3263,6 +3272,22 @@ export class AgentSession {
 		if (event.type === "message_update") {
 			this.#emit(event);
 			void this.#queueExtensionEvent(event);
+			return;
+		}
+		// Emit message boundaries to local subscribers BEFORE awaiting extension
+		// delivery. This method runs inside concurrent fire-and-forget
+		// #handleAgentEvent calls, so an await ahead of #emit lets a later
+		// event's synchronous message_update fast-path emit overtake this one —
+		// the TUI then sees an assistant stream with no message_start
+		// (streamingComponent never created → blank first turn), and a
+		// message_end stalled behind slow extension hooks (advisor) leaves the
+		// final block unrendered once the next message starts streaming. Other
+		// event types keep extension-first order: post-prompt recovery paths
+		// depend on it (reordering agent_end/turn events hangs
+		// agent-session-auto-compaction-queue).
+		if (event.type === "message_start" || event.type === "message_end") {
+			this.#emit(event);
+			await this.#emitExtensionEvent(event);
 			return;
 		}
 		await this.#emitExtensionEvent(event);
@@ -3560,6 +3585,19 @@ export class AgentSession {
 			} else if (!isError && MID_RUN_TODO_NUDGE_MUTATING_TOOLS[toolName]) {
 				this.#mutationsSinceLastTodoTouch++;
 			}
+			// A tool actually ran. Clear the post-reminder suppression synchronously,
+			// for the same reason as the counter above: a trailing agent_end in the
+			// same dispatch burst runs #checkTodoCompletion after its own awaits, and
+			// clearing below the persistence await would let that check observe stale
+			// suppression and swallow a legitimate re-escalation.
+			this.#todoReminderAwaitingProgress = false;
+		}
+		// Track the last assistant message for agent_end (auto-compaction, stop-time
+		// todo checks) synchronously as well: agent_end in the same dispatch burst
+		// must see THIS message, not a stale tool-use turn still awaiting its
+		// persistence slot.
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#lastAssistantMessage = event.message;
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -3760,9 +3798,7 @@ export class AgentSession {
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
-			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
-				this.#lastAssistantMessage = event.message;
 				const assistantMsg = event.message as AssistantMessage;
 				if (
 					assistantMsg.disabledFeatures?.includes("priority") &&
@@ -3825,10 +3861,6 @@ export class AgentSession {
 					isError?: boolean;
 					content?: Array<TextContent | ImageContent>;
 				};
-				// A tool actually ran. Clear the post-reminder suppression: the agent did
-				// productive work in response to the prior nudge, so the next text-only stop
-				// is allowed to escalate to the next reminder if todos remain incomplete.
-				this.#todoReminderAwaitingProgress = false;
 				// Invalidate streaming edit cache when edit tool completes to prevent stale data
 				if (toolName === "edit" && details?.path) {
 					this.#invalidateFileCacheForPath(details.path);
@@ -7854,7 +7886,10 @@ export class AgentSession {
 			hasPendingMessages: () => this.queuedMessageCount > 0,
 			shutdown: () => {
 				void this.dispose();
-				process.exit(0);
+				// Daemon sessions inject onExit to end only this connection; standalone
+				// (unset) keeps the original process.exit(0).
+				if (this.#onExit) this.#onExit();
+				else process.exit(0);
 			},
 			getContextUsage: () => this.getContextUsage(),
 			waitForIdle: () => this.waitForIdle(),
@@ -11379,14 +11414,6 @@ export class AgentSession {
 			attempt: this.#todoReminderCount,
 		});
 
-		// Emit event for UI to render notification
-		await this.#emitSessionEvent({
-			type: "todo_reminder",
-			todos: incomplete,
-			attempt: this.#todoReminderCount,
-			maxAttempts: remindersMax,
-		});
-
 		const reminderMessage: Message = {
 			role: "developer",
 			content: [{ type: "text", text: reminder }],
@@ -11401,8 +11428,18 @@ export class AgentSession {
 		this.#mutationsSinceLastTodoTouch = 0;
 		this.#todoReminderAwaitingProgress = true;
 		// Inject reminder and persist it so the JSONL transcript matches model context.
+		// Append BEFORE emitting: subscribers treat todo_reminder as "the reminder is
+		// in the transcript" and read the branch from inside the event callback.
 		this.agent.appendMessage(reminderMessage);
 		this.sessionManager.appendMessage(reminderMessage);
+
+		await this.#emitSessionEvent({
+			type: "todo_reminder",
+			todos: incomplete,
+			attempt: this.#todoReminderCount,
+			maxAttempts: remindersMax,
+		});
+
 		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
 		return true;
 	}

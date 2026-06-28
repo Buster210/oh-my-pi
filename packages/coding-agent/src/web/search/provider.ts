@@ -9,6 +9,7 @@
 // listings can share it without importing provider implementations.
 
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import { scopedSlot } from "../../modes/daemon/session-scope";
 import type { SearchProvider } from "./providers/base";
 import { SEARCH_PROVIDER_LABELS, SEARCH_PROVIDER_ORDER, SearchProviderError, type SearchProviderId } from "./types";
 
@@ -165,23 +166,27 @@ export async function getSearchProvider(id: SearchProviderId): Promise<SearchPro
 }
 
 /** Preferred provider set via settings (default: auto) */
-let preferredProvId: SearchProviderId | "auto" = "auto";
+const preferredProviderSlot = scopedSlot("preferredSearchProvider", "auto" as SearchProviderId | "auto");
 
 /** Set the preferred web search provider from settings */
 export function setPreferredSearchProvider(provider: SearchProviderId | "auto"): void {
-	preferredProvId = provider;
+	preferredProviderSlot.set(provider);
 }
 
 /** Providers excluded from web search resolution via settings. */
-let excludedProvIds = new Set<SearchProviderId>();
+const excludedProvidersSlot = scopedSlot("excludedSearchProviders", new Set<SearchProviderId>());
 
 /** Set providers that web search should never use, including fallbacks. */
 export function setExcludedSearchProviders(providers: readonly SearchProviderId[]): void {
-	excludedProvIds = new Set(providers);
+	excludedProvidersSlot.set(new Set(providers));
 }
 
 function isSearchProviderExcluded(id: SearchProviderId): boolean {
-	return excludedProvIds.has(id);
+	return excludedProvidersSlot.get().has(id);
+}
+
+function getPreferredSearchProvider(): SearchProviderId | "auto" {
+	return preferredProviderSlot.get();
 }
 
 /**
@@ -191,7 +196,7 @@ function isSearchProviderExcluded(id: SearchProviderId): boolean {
  */
 export async function resolveProviderChain(
 	authStorage: AuthStorage,
-	preferredProvider: SearchProviderId | "auto" = preferredProvId,
+	preferredProvider: SearchProviderId | "auto" = getPreferredSearchProvider(),
 ): Promise<SearchProvider[]> {
 	const providers: SearchProvider[] = [];
 

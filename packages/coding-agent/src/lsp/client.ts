@@ -50,10 +50,9 @@ export function setIdleTimeout(ms: number | null | undefined): void {
 function startIdleChecker(): void {
 	if (idleCheckInterval) return;
 	idleCheckInterval = setInterval(() => {
-		if (!idleTimeoutMs) return;
 		const now = Date.now();
 		for (const [key, client] of Array.from(clients.entries())) {
-			if (now - client.lastActivity > idleTimeoutMs) {
+			if (client.idleTimeoutMs && now - client.lastActivity > client.idleTimeoutMs) {
 				void shutdownClient(key);
 			}
 		}
@@ -691,6 +690,10 @@ export async function getOrCreateClient(
 			isReading: false,
 			status: "connecting",
 			lastActivity: Date.now(),
+			// Captured at spawn time from the calling session's `setIdleTimeout` — each
+			// client keeps its own session's config instead of a shared module value
+			// that the last caller to configure the daemon would silently overwrite.
+			idleTimeoutMs,
 			writeQueue: Promise.resolve(),
 			activeProgressTokens: new Set(),
 			projectLoaded,

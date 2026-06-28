@@ -5,17 +5,30 @@
  */
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { AgentStorage } from "../session/agent-storage";
-import type { MCPServerConfig, MCPToolDefinition } from "./types";
+import type { MCPPrompt, MCPResource, MCPResourceTemplate, MCPServerConfig, MCPToolDefinition } from "./types";
 
 const CACHE_VERSION = 1;
 const CACHE_PREFIX = "mcp_tools:";
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * Cached advertisement of a server — everything servable without a live
+ * connection: tool definitions (callable placeholders), instructions (system
+ * prompt injection), and prompt/resource listings (menus). Invoking any of
+ * them wakes the real server; content always comes from the live connection.
+ */
+export type MCPServerSnapshot = {
+	tools: MCPToolDefinition[];
+	instructions?: string;
+	prompts?: MCPPrompt[];
+	resources?: MCPResource[];
+	resourceTemplates?: MCPResourceTemplate[];
+};
+
 type MCPToolCachePayload = {
 	version: number;
 	configHash: string;
-	tools: MCPToolDefinition[];
-};
+} & MCPServerSnapshot;
 
 function stableClone(value: unknown): unknown {
 	if (Array.isArray(value)) {
@@ -57,7 +70,7 @@ function cacheKey(serverName: string): string {
 export class MCPToolCache {
 	constructor(private storage: AgentStorage) {}
 
-	async get(serverName: string, config: MCPServerConfig): Promise<MCPToolDefinition[] | null> {
+	async get(serverName: string, config: MCPServerConfig): Promise<MCPServerSnapshot | null> {
 		const key = cacheKey(serverName);
 		const raw = this.storage.getCache(key);
 		if (!raw) return null;
@@ -85,10 +98,23 @@ export class MCPToolCache {
 
 		if (parsed.configHash !== currentHash) return null;
 
-		return parsed.tools as MCPToolDefinition[];
+		return {
+			tools: parsed.tools as MCPToolDefinition[],
+			instructions: typeof parsed.instructions === "string" ? parsed.instructions : undefined,
+			prompts: Array.isArray(parsed.prompts) ? (parsed.prompts as MCPPrompt[]) : undefined,
+			resources: Array.isArray(parsed.resources) ? (parsed.resources as MCPResource[]) : undefined,
+			resourceTemplates: Array.isArray(parsed.resourceTemplates)
+				? (parsed.resourceTemplates as MCPResourceTemplate[])
+				: undefined,
+		};
 	}
 
-	async set(serverName: string, config: MCPServerConfig, tools: MCPToolDefinition[]): Promise<void> {
+	async set(
+		serverName: string,
+		config: MCPServerConfig,
+		tools: MCPToolDefinition[],
+		extras?: Omit<MCPServerSnapshot, "tools">,
+	): Promise<void> {
 		let configHash: string;
 		try {
 			configHash = await hashConfig(config);
@@ -97,10 +123,27 @@ export class MCPToolCache {
 			return;
 		}
 
+		// Tools-only writers (refresh paths) must not wipe the cached
+		// instructions/prompts/resources snapshot — preserve the prior extras.
+		let preserved: Omit<MCPServerSnapshot, "tools"> = {};
+		if (!extras) {
+			const existing = await this.get(serverName, config);
+			if (existing) {
+				preserved = {
+					instructions: existing.instructions,
+					prompts: existing.prompts,
+					resources: existing.resources,
+					resourceTemplates: existing.resourceTemplates,
+				};
+			}
+		}
+
 		const payload: MCPToolCachePayload = {
 			version: CACHE_VERSION,
 			configHash,
 			tools,
+			...preserved,
+			...extras,
 		};
 
 		let serialized: string;

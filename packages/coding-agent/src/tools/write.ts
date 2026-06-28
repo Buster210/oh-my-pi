@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -489,15 +488,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		content: string,
 		resolvedSqlitePath: ResolvedSqliteWritePath,
 	): Promise<AgentToolResult<WriteToolDetails>> {
-		let db: Database | null = null;
 		try {
 			if (!resolvedSqlitePath.exists) {
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
 
-			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
-			db.run("PRAGMA busy_timeout = 3000");
-
+			const dbPath = resolvedSqlitePath.absolutePath;
 			const trimmedContent = content.trim();
 			let resultText: string;
 			if (trimmedContent.length === 0) {
@@ -505,11 +501,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					throw new ToolError("SQLite deletes require a row key in the path");
 				}
 
-				const lookup = resolveTableRowLookup(db, resolvedSqlitePath.table);
+				const lookup = await resolveTableRowLookup(dbPath, resolvedSqlitePath.table);
 				const deleted =
 					lookup.kind === "pk"
-						? deleteRowByKey(db, resolvedSqlitePath.table, lookup, resolvedSqlitePath.key)
-						: deleteRowByRowId(db, resolvedSqlitePath.table, resolvedSqlitePath.key);
+						? await deleteRowByKey(dbPath, resolvedSqlitePath.table, lookup, resolvedSqlitePath.key)
+						: await deleteRowByRowId(dbPath, resolvedSqlitePath.table, resolvedSqlitePath.key);
 				resultText =
 					deleted > 0
 						? `Deleted row '${resolvedSqlitePath.key}' from ${resolvedSqlitePath.table}`
@@ -529,26 +525,29 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 
 				if (resolvedSqlitePath.key) {
-					const lookup = resolveTableRowLookup(db, resolvedSqlitePath.table);
+					const lookup = await resolveTableRowLookup(dbPath, resolvedSqlitePath.table);
 					const updated =
 						lookup.kind === "pk"
-							? updateRowByKey(db, resolvedSqlitePath.table, lookup, resolvedSqlitePath.key, parsedContent)
-							: updateRowByRowId(db, resolvedSqlitePath.table, resolvedSqlitePath.key, parsedContent);
+							? await updateRowByKey(
+									dbPath,
+									resolvedSqlitePath.table,
+									lookup,
+									resolvedSqlitePath.key,
+									parsedContent,
+								)
+							: await updateRowByRowId(dbPath, resolvedSqlitePath.table, resolvedSqlitePath.key, parsedContent);
 					resultText =
 						updated > 0
 							? `Updated row '${resolvedSqlitePath.key}' in ${resolvedSqlitePath.table}`
 							: `No row updated in ${resolvedSqlitePath.table} for key '${resolvedSqlitePath.key}'`;
 				} else {
-					insertRow(db, resolvedSqlitePath.table, parsedContent);
+					await insertRow(dbPath, resolvedSqlitePath.table, parsedContent);
 					resultText = `Inserted row into ${resolvedSqlitePath.table}`;
 				}
 			}
 
-			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
-			return toolResult<WriteToolDetails>({ resolvedPath: resolvedSqlitePath.absolutePath })
-				.text(resultText)
-				.sourcePath(resolvedSqlitePath.absolutePath)
-				.done();
+			invalidateFsScanAfterWrite(dbPath);
+			return toolResult<WriteToolDetails>({ resolvedPath: dbPath }).text(resultText).sourcePath(dbPath).done();
 		} catch (error) {
 			if (isEnoent(error)) {
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
@@ -557,8 +556,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				throw error;
 			}
 			throw new ToolError(error instanceof Error ? error.message : String(error));
-		} finally {
-			db?.close();
 		}
 	}
 

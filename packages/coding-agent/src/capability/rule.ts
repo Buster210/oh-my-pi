@@ -4,6 +4,8 @@
  * Project-specific rules from Cursor (.mdc), Windsurf (.md), and Cline formats.
  * Translated to a canonical shape regardless of source format.
  */
+
+import { getSessionScope } from "../modes/daemon/session-scope";
 import { defineCapability } from ".";
 import type { SourceMeta } from "./types";
 
@@ -233,11 +235,16 @@ let activeRules: readonly Rule[] = [];
  * Read by internal URL protocol handlers (rule://).
  */
 export function getActiveRules(): readonly Rule[] {
-	return activeRules;
+	return getSessionScope()?.activeRules ?? activeRules;
 }
 
 /** Replace the active rule snapshot. Called once per top-level session. */
 export function setActiveRules(value: readonly Rule[]): void {
+	const scope = getSessionScope();
+	if (scope) {
+		scope.activeRules = value;
+		return;
+	}
 	activeRules = value;
 }
 

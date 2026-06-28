@@ -481,6 +481,14 @@ function releaseGlobalKey(key: string, owner: symbol): void {
 // Plain globalThis cannot safely serve two different runtimes at the same instant:
 // helpers dereference reserved globals on every call. Sequential cmux tab revisits
 // re-activate their owner stack; overlapping cross-runtime runs fail explicitly.
+// NOTE: this is NOT a cross-session daemon limit. Each agent session runs its JS
+// eval in its own Bun Worker thread (context-manager.ts spawnJsWorker, keyed per
+// sessionKey), and this module is instantiated once PER worker realm — so
+// activeGlobalRunOwner is per-thread and never collides between sessions. The
+// guard only serializes multiple JsRuntime instances sharing ONE realm: browser
+// multi-tabs (cmux-tab.ts) and the rare inline worker fallback. node:vm is not an
+// option here — Bun SIGTRAP-crashes on Worker.terminate() mid vm.runInContext
+// (see indirect-eval.ts), which is exactly the runaway-eval abort path.
 let activeGlobalRunOwner: symbol | null = null;
 let activeGlobalRunDepth = 0;
 

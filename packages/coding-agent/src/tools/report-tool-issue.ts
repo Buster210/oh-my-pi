@@ -25,6 +25,7 @@ import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { $env, $flag, getAutoQaDbDir, getInstallId, logger, VERSION } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { Settings } from "..";
+import { getSessionScope } from "../modes/daemon/session-scope";
 import type { ToolSession } from "./index";
 
 function buildReportToolIssueParams(activeBuiltinNames: readonly string[]) {
@@ -67,30 +68,28 @@ export function isAutoQaEnabled(settings?: Settings): boolean {
  */
 export type AutoQaConsentHandler = () => Promise<boolean | null>;
 
-let consentHandler: AutoQaConsentHandler | null = null;
 /**
- * Persistent settings instance supplied by the consent-handler registrant.
- * Subagents have in-memory `Settings` snapshots that don't write to disk;
- * we persist the decision through this disk-backed reference so a grant
- * survives across runs even when triggered from a subagent tool call.
+ * Standalone fallback storage — used whenever no session scope is active
+ * (the normal, non-daemon path). Mirrors the shape of
+ * `SessionScope.autoQaConsentState` so `stateFor()` can hand either one to
+ * callers uniformly.
  */
-let persistentConsentSettings: Settings | null = null;
-/**
- * Process-global cache of the resolved consent decision. Survives across
- * subagent boundaries (subagents share this module instance), so a grant
- * in the parent applies immediately to children — including children that
- * spawned BEFORE the grant and would otherwise see a stale snapshot of
- * `dev.autoqa.consent` in their isolated `Settings`.
- *
- * `null` = never asked, never cached.
- */
-let cachedConsent: boolean | null = null;
-/**
- * Single-flight in-flight consent request. While the dialog is open, every
- * concurrent `report_tool_issue` call (main + every subagent) awaits this
- * promise instead of stacking duplicate popups.
- */
-let consentInFlight: Promise<boolean> | null = null;
+const globalState: {
+	handler: AutoQaConsentHandler | null;
+	persistentSettings: Settings | null;
+	cachedConsent: boolean | null;
+	consentInFlight: Promise<boolean> | null;
+} = {
+	handler: null,
+	persistentSettings: null,
+	cachedConsent: null,
+	consentInFlight: null,
+};
+
+/** Resolve the active consent state: the current session's scope, or the module fallback. */
+function stateFor(): typeof globalState {
+	return getSessionScope()?.autoQaConsentState ?? globalState;
+}
 
 /**
  * Register the consent handler and the persistent {@link Settings} instance
@@ -101,16 +100,17 @@ export function setAutoQaConsentHandler(
 	handler: AutoQaConsentHandler | null,
 	persistentSettings: Settings | null = null,
 ): void {
-	consentHandler = handler;
-	persistentConsentSettings = persistentSettings;
+	const state = stateFor();
+	state.handler = handler;
+	state.persistentSettings = persistentSettings;
 }
 
 /** Test-only: clear consent cache + handler. Never call from production code. */
 export function __resetAutoQaConsentForTests(): void {
-	consentHandler = null;
-	persistentConsentSettings = null;
-	cachedConsent = null;
-	consentInFlight = null;
+	globalState.handler = null;
+	globalState.persistentSettings = null;
+	globalState.cachedConsent = null;
+	globalState.consentInFlight = null;
 }
 
 function readPersistedConsent(settings: Settings | undefined): boolean | null {
@@ -126,7 +126,7 @@ function persistConsent(localSettings: Settings | undefined, granted: boolean): 
 	// Write on every settings instance we know about. The local one keeps
 	// the in-memory snapshot consistent for the current subagent; the
 	// persistent one (registered by the host) is what actually lands on disk.
-	for (const target of [localSettings, persistentConsentSettings]) {
+	for (const target of [localSettings, stateFor().persistentSettings]) {
 		if (!target) continue;
 		try {
 			target.set("dev.autoqa.consent", value);
@@ -151,16 +151,17 @@ function persistConsent(localSettings: Settings | undefined, granted: boolean): 
  * permanently locked into the false branch.
  */
 export async function resolveAutoQaConsent(settings: Settings | undefined): Promise<boolean> {
-	if (cachedConsent !== null) return cachedConsent;
-	const persisted = readPersistedConsent(settings) ?? readPersistedConsent(persistentConsentSettings ?? undefined);
+	const state = stateFor();
+	if (state.cachedConsent !== null) return state.cachedConsent;
+	const persisted = readPersistedConsent(settings) ?? readPersistedConsent(state.persistentSettings ?? undefined);
 	if (persisted !== null) {
-		cachedConsent = persisted;
+		state.cachedConsent = persisted;
 		return persisted;
 	}
-	if (!consentHandler) return false;
-	if (consentInFlight) return consentInFlight;
-	const handler = consentHandler;
-	consentInFlight = (async () => {
+	if (!state.handler) return false;
+	if (state.consentInFlight) return state.consentInFlight;
+	const handler = state.handler;
+	state.consentInFlight = (async () => {
 		try {
 			const granted = await handler();
 			if (granted === null) {
@@ -170,17 +171,17 @@ export async function resolveAutoQaConsent(settings: Settings | undefined): Prom
 				// permanent opt-out.
 				return false;
 			}
-			cachedConsent = granted;
+			state.cachedConsent = granted;
 			persistConsent(settings, granted);
 			return granted;
 		} catch (error) {
 			logger.warn("autoqa consent handler threw", { error: String(error) });
 			return false;
 		} finally {
-			consentInFlight = null;
+			state.consentInFlight = null;
 		}
 	})();
-	return consentInFlight;
+	return state.consentInFlight;
 }
 
 let cachedDb: Database | null = null;

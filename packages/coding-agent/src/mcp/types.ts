@@ -63,6 +63,12 @@ export interface MCPAuthConfig {
 interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/**
+	 * Whether this server may be lazily deferred at startup (default: true).
+	 * `false` forces a real connection as soon as the session starts, even
+	 * when cached tool definitions could stand in.
+	 */
+	lazy?: boolean;
 	/** MCP request timeout in milliseconds (default: 30000, 0 to disable) */
 	timeout?: number;
 	/** Authentication configuration (optional) */

@@ -8,6 +8,7 @@ import "@oh-my-pi/pi-coding-agent/tools/renderers";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import {
+	executeReadQuery,
 	listTables,
 	parseSqlitePathCandidates,
 	parseSqliteSelector,
@@ -481,54 +482,71 @@ describe("SQLite tool support", () => {
 });
 
 describe("SQLite table listing row counts", () => {
-	// These tests exercise `listTables`/`renderTableList` directly against a
-	// `Database` handle, so an in-memory database preserves the row-count
-	// contract with zero disk I/O. `base` is never analyzed (exact / lower-bound
-	// behavior); `analyzed` carries planner estimates.
-	let base: Database;
-	let analyzed: Database;
+	let countsTmpDir: string;
+	let basePath: string;
+	let analyzedPath: string;
 
-	function buildCountsDb(analyze: boolean): Database {
+	async function buildCountsDbFile(name: string, analyze: boolean): Promise<string> {
 		const db = new Database(":memory:");
-		db.run("CREATE TABLE big (id INTEGER PRIMARY KEY, v TEXT NOT NULL)");
-		db.run("CREATE TABLE small (id INTEGER PRIMARY KEY)");
-		const bigStmt = db.prepare("INSERT INTO big (v) VALUES (?)");
-		for (let i = 0; i < 10; i++) bigStmt.run("x");
-		const smallStmt = db.prepare("INSERT INTO small DEFAULT VALUES");
-		for (let i = 0; i < 2; i++) smallStmt.run();
-		if (analyze) db.run("ANALYZE");
-		return db;
+		try {
+			db.run("CREATE TABLE big (id INTEGER PRIMARY KEY, v TEXT NOT NULL)");
+			db.run("CREATE TABLE small (id INTEGER PRIMARY KEY)");
+			const bigStmt = db.prepare("INSERT INTO big (v) VALUES (?)");
+			for (let i = 0; i < 10; i++) bigStmt.run("x");
+			const smallStmt = db.prepare("INSERT INTO small DEFAULT VALUES");
+			for (let i = 0; i < 2; i++) smallStmt.run();
+			if (analyze) db.run("ANALYZE");
+			const dbPath = path.join(countsTmpDir, name);
+			await fs.writeFile(dbPath, db.serialize());
+			return dbPath;
+		} finally {
+			db.close();
+		}
 	}
 
-	beforeAll(() => {
-		base = buildCountsDb(false);
-		analyzed = buildCountsDb(true);
+	beforeAll(async () => {
+		countsTmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sqlite-counts-"));
+		basePath = await buildCountsDbFile("counts-base.sqlite", false);
+		analyzedPath = await buildCountsDbFile("counts-analyzed.sqlite", true);
 	});
 
-	afterAll(() => {
-		base.close();
-		analyzed.close();
+	afterAll(async () => {
+		await removeWithRetries(countsTmpDir);
 	});
 
-	it("counts small tables exactly", () => {
-		const rendered = renderTableList(listTables(base, { probeCap: 100 }));
+	it("counts small tables exactly", async () => {
+		const rendered = renderTableList(await listTables(basePath, { probeCap: 100 }));
 		expect(rendered).toContain("big (10 rows)");
 		expect(rendered).toContain("small (2 rows)");
 	});
 
-	it("reports the planner estimate for tables larger than the probe cap", () => {
+	it("reports the planner estimate for tables larger than the probe cap", async () => {
 		// probeCap=5: big (estimate 10) exceeds it and is reported as an estimate
 		// without scanning; small (estimate 2) is counted exactly.
-		const rendered = renderTableList(listTables(analyzed, { probeCap: 5 }));
+		const rendered = renderTableList(await listTables(analyzedPath, { probeCap: 5 }));
 		expect(rendered).toContain("big (~10 rows)");
 		expect(rendered).toContain("small (2 rows)");
 	});
 
-	it("reports a lower bound when an unanalyzed table exceeds the probe cap", () => {
+	it("reports a lower bound when an unanalyzed table exceeds the probe cap", async () => {
 		// No ANALYZE, so no estimate exists; the bounded probe stops at the cap
 		// and reports a lower bound instead of scanning the whole table.
-		const rendered = renderTableList(listTables(base, { probeCap: 3 }));
+		const rendered = renderTableList(await listTables(basePath, { probeCap: 3 }));
 		expect(rendered).toContain("big (3+ rows)");
 		expect(rendered).toContain("small (2 rows)");
+	});
+
+	it("times out a runaway raw query and keeps serving later sqlite calls", async () => {
+		const slowSql = `
+			WITH RECURSIVE spin(n) AS (
+				SELECT 1
+				UNION ALL
+				SELECT n + 1 FROM spin WHERE n < 100000000
+			)
+			SELECT COUNT(*) AS count FROM spin
+		`;
+
+		await expect(executeReadQuery(basePath, slowSql, { timeoutMs: 1 })).rejects.toThrow(/timed out/i);
+		expect(renderTableList(await listTables(basePath, { probeCap: 100 }))).toContain("big (10 rows)");
 	});
 });

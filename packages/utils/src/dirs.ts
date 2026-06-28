@@ -11,16 +11,17 @@
  * — if the env var is set, omp trusts that the migration has been done.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
 
-/** App name (e.g. "omp") */
-export const APP_NAME: string = "omp";
+/** App name (e.g. "omp"). Override via OMP_APP_NAME to run a distinct app (e.g. "ompp") — drives process.title, --help bin name, TUI banner, config dir. */
+export const APP_NAME: string = process.env.OMP_APP_NAME || "omp";
 
-/** Config directory name (e.g. ".omp") */
-export const CONFIG_DIR_NAME: string = ".omp";
+/** Config directory name (e.g. ".omp"), derived from APP_NAME so a renamed app isolates its state (~/.ompp, project .ompp). PI_CONFIG_DIR still overrides the home root. */
+export const CONFIG_DIR_NAME: string = `.${APP_NAME}`;
 
 /** Version (e.g. "1.0.0") */
 export const VERSION: string = version;
@@ -174,15 +175,48 @@ export function relativePathWithinRoot(root: string, candidate: string): string 
 
 let projectDir = standardizeMacOSPath(process.cwd());
 
+// ponytail: a shared daemon serves multiple client sessions from one process, but
+// getProjectDir()/setProjectDir() were written for one cwd per process (~73 call
+// sites lean on that global). Rather than thread `cwd` through every reader, scope
+// the existing global behind an AsyncLocalStorage: a daemon session runs its whole
+// request inside `runWithProjectDir`, so getProjectDir() resolves per-session while
+// every reader keeps calling the same function. Outside any scope (standalone CLI),
+// behavior is byte-identical to before this change.
+const cwdScope = new AsyncLocalStorage<{ cwd: string; worktreesDir?: string }>();
+
 /** Get the project directory. */
 export function getProjectDir(): string {
-	return projectDir;
+	return cwdScope.getStore()?.cwd ?? projectDir;
 }
 
 /** Set the project directory. */
 export function setProjectDir(dir: string): void {
+	const store = cwdScope.getStore();
+	if (store) {
+		// Inside a daemon session scope: mutate only this session's cwd. Never
+		// touch the module-global or process.chdir — chdir is process-wide and
+		// would corrupt every other concurrent session sharing this process.
+		store.cwd = standardizeMacOSPath(path.resolve(dir));
+		return;
+	}
 	projectDir = standardizeMacOSPath(path.resolve(dir));
 	process.chdir(projectDir);
+}
+
+/** Run `fn` with `getProjectDir()` scoped to `cwd` for the duration (and its full async subtree). */
+export function runWithProjectDir<T>(cwd: string, fn: () => T): T {
+	return cwdScope.run({ cwd: standardizeMacOSPath(path.resolve(cwd)) }, fn);
+}
+// ponytail: shared-daemon sessions must not mutate process-wide profile/agent-dir
+// state — one client switching profiles would silently re-point every other session's
+// config root. Guard setProfile/setAgentDir against this by detecting the daemon
+// session scope and throwing instead of corrupting shared state. Standalone CLI
+// never enters this scope, so behaviour there is unchanged.
+const daemonSessionScope = new AsyncLocalStorage<boolean>();
+
+/** Run `fn` inside a daemon session scope. `setProfile`/`setAgentDir` throw inside this scope. */
+export function runWithDaemonSessionScope<T>(fn: () => T): T {
+	return daemonSessionScope.run(true, fn);
 }
 
 /**
@@ -404,8 +438,18 @@ export function getConfigRootDir(): string {
 	return dirs.configRoot;
 }
 
+/** Throws if called from a shared-daemon session, where switching profile/agent-dir would corrupt other sessions' config root. */
+function assertNotDaemonScoped(action: string, noun: string): void {
+	if (daemonSessionScope.getStore()) {
+		throw new Error(
+			`${action} is not available in shared-daemon sessions (profile/agent-dir switching would corrupt other sessions' config root). Start a standalone session to switch ${noun}.`,
+		);
+	}
+}
+
 /** Set the coding agent directory. Creates a fresh resolver, invalidating all cached paths. */
 export function setAgentDir(dir: string): void {
+	assertNotDaemonScoped("setAgentDir", "agent dirs");
 	activeProfile = undefined;
 	dirs = new DirResolver({ agentDirOverride: dir });
 	process.env.PI_CODING_AGENT_DIR = dir;
@@ -445,6 +489,7 @@ export function __resetDirsFromEnvForTests(): void {
 
 /** Activate a named profile. Passing undefined or "default" returns to the default profile. */
 export function setProfile(profile: string | undefined): void {
+	assertNotDaemonScoped("setProfile", "profiles");
 	const next = normalizeProfileName(profile);
 	if (next && !activeProfile) {
 		// First activation of a named profile in this process: snapshot the
@@ -584,8 +629,24 @@ let worktreesDirOverride: string | undefined;
  * `undefined`.
  */
 export function setWorktreesDir(dir: string | undefined): string | undefined {
-	worktreesDirOverride = resolveWorktreeBase(dir);
-	return worktreesDirOverride;
+	const resolved = resolveWorktreeBase(dir);
+	// Inside a daemon session scope: mutate only this session's override, same
+	// rationale as setProjectDir — a bare module-global write would leak one
+	// session's worktree.base setting into every other concurrent session.
+	// ponytail: rides the same cwdScope ALS as getProjectDir/setProjectDir, so
+	// it shares that scope's boundary — only populated when a caller wraps the
+	// session in runWithProjectDir (today: the daemon's TUI branch with a known
+	// client cwd). RPC-mode sessions fall through to the module global, same as
+	// getProjectDir/setProjectDir already do on that path. Upgrade path: give
+	// RPC sessions a scope wrapper too, or lift this to its own ALS if that gap
+	// needs closing independently of the cwd one.
+	const store = cwdScope.getStore();
+	if (store) {
+		store.worktreesDir = resolved;
+		return resolved;
+	}
+	worktreesDirOverride = resolved;
+	return resolved;
 }
 
 /**
@@ -596,7 +657,12 @@ export function setWorktreesDir(dir: string | undefined): string | undefined {
  * ignored and resolution falls through.
  */
 export function getWorktreesDir(): string {
-	return resolveWorktreeBase(process.env.OMP_WORKTREE_DIR) ?? worktreesDirOverride ?? dirs.rootSubdir("wt", "data");
+	return (
+		resolveWorktreeBase(process.env.OMP_WORKTREE_DIR) ??
+		cwdScope.getStore()?.worktreesDir ??
+		worktreesDirOverride ??
+		dirs.rootSubdir("wt", "data")
+	);
 }
 
 /** Get the SSH control socket directory (~/.omp/ssh-control). */

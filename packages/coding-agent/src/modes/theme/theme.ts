@@ -14,6 +14,7 @@ import { adjustHsv, colorLuma, getCustomThemesDir, isEnoent, logger, relativeLum
 import { type } from "arktype";
 import chalk from "chalk";
 import { LRUCache } from "lru-cache/raw";
+import { scopedSlot } from "../daemon/session-scope";
 // Embed theme JSON files at build time
 import darkThemeJson from "./dark.json" with { type: "json" };
 import { defaultThemes } from "./defaults";
@@ -2145,46 +2146,147 @@ function detectTerminalBackground(): "dark" | "light" {
 
 function getDefaultTheme(): string {
 	const bg = detectTerminalBackground();
-	return bg === "light" ? autoLightTheme : autoDarkTheme;
+	return bg === "light" ? getAutoLightTheme() : getAutoDarkTheme();
 }
 
 // ============================================================================
 // Global Theme Instance
 // ============================================================================
 
-export var theme: Theme;
-var currentThemeName: string | undefined;
+// `theme` is read directly as `theme.fg(...)` etc. in ~100 files (73+ under
+// modes/components alone) — converting every call site to `getTheme().fg(...)`
+// is out of scope here, so instead `theme` keeps ONE permanent identity (this
+// Proxy) that every existing call site keeps working against unchanged, while
+// what it delegates to resolves per-session. `globalTheme` is the real
+// module-level instance (module-private, standalone/no-scope fallback);
+// `getTheme()` is scope-first. Perf: Proxy get-trap overhead measured at
+// ~50ns/call, ~0.1ms for a busy 2000-call render frame against a 33ms frame
+// budget — negligible.
+// Shared scope-or-global storage for the six session-scoped theme fields
+// below: each falls back to a module-level global when no session scope is
+// active (standalone CLI, workers), and reads/writes the scope instead when
+// one is (shared-host daemon) — the daemon's per-session isolation this
+// module exists for. Get/set semantics are byte-identical to a hand-rolled
+// `getSessionScope()?.X ?? globalX` / scope-if-present-else-global pair.
+// (scopedSlot itself lives in session-scope.ts, next to SessionScope.)
+
+const themeSlot = scopedSlot("theme", undefined as Theme | undefined);
+
+function getTheme(): Theme | undefined {
+	return themeSlot.get();
+}
+
+export function isThemeReady(): boolean {
+	return getTheme() !== undefined;
+}
+
+function setGlobalOrScopedTheme(t: Theme): void {
+	themeSlot.set(t);
+}
+
+export const theme: Theme = new Proxy({} as Theme, {
+	get(target, prop) {
+		// Allow runtime property shadows (e.g. Object.defineProperty in tests)
+		// to take effect before delegating to the live theme instance.
+		if (Object.hasOwn(target, prop)) {
+			return Reflect.get(target, prop, target);
+		}
+		const t = getTheme();
+		if (t === undefined) {
+			// Mirrors the pre-Proxy behavior: reading a property before initTheme()
+			// assigned the module global threw "Cannot read properties of undefined".
+			throw new TypeError(`Cannot read properties of undefined (reading '${String(prop)}')`);
+		}
+		// Receiver must be `t` itself, not the Proxy: Theme's getters (e.g. `nav`)
+		// read private (#) fields via `this`, and a private field access only
+		// works when `this` is a real instance of the declaring class — passing
+		// the Proxy as receiver would run the getter with `this` = Proxy and
+		// throw "Cannot access invalid private field".
+		const value = Reflect.get(t, prop, t);
+		return typeof value === "function" ? value.bind(t) : value;
+	},
+	has(_target, prop) {
+		const t = getTheme();
+		return t !== undefined && Reflect.has(t, prop);
+	},
+});
+
+const themeNameSlot = scopedSlot("currentThemeName", undefined as string | undefined);
+
+function getCurrentThemeNameInternal(): string | undefined {
+	return themeNameSlot.get();
+}
+
+function setCurrentThemeNameInternal(name: string | undefined): void {
+	themeNameSlot.set(name);
+}
 
 /** Get the name of the currently active theme. */
 export function getCurrentThemeName(): string | undefined {
-	return currentThemeName;
+	return getCurrentThemeNameInternal();
 }
 
 /** Returns unstyled `text` before `initTheme()` assigns the global theme; use only for early-render paths. */
 export function fgOrPlain(color: ThemeColor, text: string, styledText: string = text): string {
-	return typeof theme === "undefined" ? text : theme.fg(color, styledText);
+	const t = getTheme();
+	return t === undefined ? text : t.fg(color, styledText);
 }
-export interface ThemeChangeEvent {
-	/** Preview/presentation-only changes should repaint live UI without replacing native scrollback. */
-	ephemeral?: boolean;
+const symbolPresetOverrideSlot = scopedSlot("currentSymbolPresetOverride", undefined as SymbolPreset | undefined);
+const colorBlindModeSlot = scopedSlot("currentColorBlindMode", false);
+
+function getSymbolPresetOverrideInternal(): SymbolPreset | undefined {
+	return symbolPresetOverrideSlot.get();
 }
 
-var currentSymbolPresetOverride: SymbolPreset | undefined;
-var currentColorBlindMode: boolean = false;
+function setSymbolPresetOverrideInternal(preset: SymbolPreset | undefined): void {
+	symbolPresetOverrideSlot.set(preset);
+}
+
+function getColorBlindModeInternal(): boolean {
+	return colorBlindModeSlot.get();
+}
+
+function setColorBlindModeInternal(enabled: boolean): void {
+	colorBlindModeSlot.set(enabled);
+}
+
 var themeWatcher: fs.FSWatcher | undefined;
 var themeReloadTimer: NodeJS.Timeout | undefined;
 var sigwinchHandler: (() => void) | undefined;
 var autoDetectedTheme: boolean = false;
-var autoDarkTheme: string = "dark";
-var autoLightTheme: string = "light";
-var onThemeChangeCallback: ((event: ThemeChangeEvent) => void) | undefined;
+const autoDarkThemeSlot = scopedSlot("autoDarkTheme", "dark");
+const autoLightThemeSlot = scopedSlot("autoLightTheme", "light");
+
+function getAutoDarkTheme(): string {
+	return autoDarkThemeSlot.get();
+}
+
+function setAutoDarkTheme(name: string): void {
+	autoDarkThemeSlot.set(name);
+}
+
+function getAutoLightTheme(): string {
+	return autoLightThemeSlot.get();
+}
+
+function setAutoLightTheme(name: string): void {
+	autoLightThemeSlot.set(name);
+}
+// ponytail: a Set, not a single slot — the daemon runs multiple concurrent
+// TUI sessions in one process, each registering its own listener via
+// onThemeChange(); a single slot meant only the last-registered session's
+// TUI ever heard about theme changes.
+export interface ThemeChangeEvent {
+	ephemeral?: boolean;
+}
+const onThemeChangeCallbacks = new Set<(event: ThemeChangeEvent) => void>();
 var themeLoadRequestId: number = 0;
 let themeEpoch = 0;
 
 function getCurrentThemeOptions(): CreateThemeOptions {
 	return {
-		symbolPresetOverride: currentSymbolPresetOverride,
-		colorBlindMode: currentColorBlindMode,
+		symbolPresetOverride: getSymbolPresetOverrideInternal(),
+		colorBlindMode: getColorBlindModeInternal(),
 	};
 }
 
@@ -2196,22 +2298,22 @@ export async function initTheme(
 	lightTheme?: string,
 ): Promise<void> {
 	autoDetectedTheme = true;
-	autoDarkTheme = darkTheme ?? "dark";
-	autoLightTheme = lightTheme ?? "light";
+	setAutoDarkTheme(darkTheme ?? "dark");
+	setAutoLightTheme(lightTheme ?? "light");
 	const name = getDefaultTheme();
-	currentThemeName = name;
-	currentSymbolPresetOverride = symbolPreset;
-	currentColorBlindMode = colorBlindMode ?? false;
+	setCurrentThemeNameInternal(name);
+	setSymbolPresetOverrideInternal(symbolPreset);
+	setColorBlindModeInternal(colorBlindMode ?? false);
 	try {
-		theme = await loadTheme(name, getCurrentThemeOptions());
+		setGlobalOrScopedTheme(await loadTheme(name, getCurrentThemeOptions()));
 		if (enableWatcher) {
 			await startThemeWatcher();
 			startSigwinchListener();
 		}
 	} catch (err) {
 		logger.debug("Theme loading failed, falling back to dark theme", { error: String(err) });
-		currentThemeName = "dark";
-		theme = await loadTheme("dark", getCurrentThemeOptions());
+		setCurrentThemeNameInternal("dark");
+		setGlobalOrScopedTheme(await loadTheme("dark", getCurrentThemeOptions()));
 		// Don't start watcher for fallback theme
 	}
 }
@@ -2221,14 +2323,14 @@ export async function setTheme(
 	enableWatcher: boolean = false,
 ): Promise<{ success: boolean; error?: string }> {
 	autoDetectedTheme = false;
-	currentThemeName = name;
+	setCurrentThemeNameInternal(name);
 	const requestId = ++themeLoadRequestId;
 	try {
 		const loadedTheme = await loadTheme(name, getCurrentThemeOptions());
 		if (requestId !== themeLoadRequestId) {
 			return { success: false, error: "Theme change superseded by a newer request" };
 		}
-		theme = loadedTheme;
+		setGlobalOrScopedTheme(loadedTheme);
 		if (enableWatcher) {
 			await startThemeWatcher();
 		}
@@ -2239,8 +2341,8 @@ export async function setTheme(
 			return { success: false, error: "Theme change superseded by a newer request" };
 		}
 		// Theme is invalid - fall back to dark theme
-		currentThemeName = "dark";
-		theme = await loadTheme("dark", getCurrentThemeOptions());
+		setCurrentThemeNameInternal("dark");
+		setGlobalOrScopedTheme(await loadTheme("dark", getCurrentThemeOptions()));
 		// The active theme just changed to the fallback — bump the epoch so memoized
 		// renderers (e.g. ToolExecutionComponent) re-shape with the fallback colors
 		// instead of holding the failed theme's stale styling.
@@ -2263,7 +2365,7 @@ export async function previewTheme(
 		if (requestId !== themeLoadRequestId) {
 			return { success: false, error: "Theme preview superseded by a newer request" };
 		}
-		theme = loadedTheme;
+		setGlobalOrScopedTheme(loadedTheme);
 		notifyThemeChange(event);
 		return { success: true };
 	} catch (error) {
@@ -2290,9 +2392,14 @@ export function enableAutoTheme(event: ThemeChangeEvent = {}): void {
  * When a dark/light mapping changes and auto-detection is active, re-evaluate the theme.
  */
 export function setAutoThemeMapping(mode: "dark" | "light", themeName: string): void {
-	if (mode === "dark") autoDarkTheme = themeName;
-	else autoLightTheme = themeName;
+	if (mode === "dark") setAutoDarkTheme(themeName);
+	else setAutoLightTheme(themeName);
 	reevaluateAutoTheme("setAutoThemeMapping");
+}
+
+/** Read the current dark/light auto-detection theme mapping (scope-first, per {@link setAutoThemeMapping}). */
+export function getAutoThemeMapping(mode: "dark" | "light"): string {
+	return mode === "dark" ? getAutoDarkTheme() : getAutoLightTheme();
 }
 
 /**
@@ -2308,8 +2415,8 @@ export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
 
 export function setThemeInstance(themeInstance: Theme): void {
 	autoDetectedTheme = false;
-	theme = themeInstance;
-	currentThemeName = "<in-memory>";
+	setGlobalOrScopedTheme(themeInstance);
+	setCurrentThemeNameInternal("<in-memory>");
 	stopThemeWatcher();
 	notifyThemeChange({ ephemeral: true });
 }
@@ -2318,18 +2425,19 @@ export function setThemeInstance(themeInstance: Theme): void {
  * Set the symbol preset override, recreating the theme with the new preset.
  */
 export async function setSymbolPreset(preset: SymbolPreset): Promise<void> {
-	currentSymbolPresetOverride = preset;
-	if (!currentThemeName) return;
+	setSymbolPresetOverrideInternal(preset);
+	const themeName = getCurrentThemeNameInternal();
+	if (!themeName) return;
 
 	const requestId = ++themeLoadRequestId;
 	try {
-		const loadedTheme = await loadTheme(currentThemeName, getCurrentThemeOptions());
+		const loadedTheme = await loadTheme(themeName, getCurrentThemeOptions());
 		if (requestId !== themeLoadRequestId) return;
-		theme = loadedTheme;
+		setGlobalOrScopedTheme(loadedTheme);
 	} catch {
 		if (requestId !== themeLoadRequestId) return;
 		// Fall back to dark theme with new preset
-		theme = await loadTheme("dark", getCurrentThemeOptions());
+		setGlobalOrScopedTheme(await loadTheme("dark", getCurrentThemeOptions()));
 		if (requestId !== themeLoadRequestId) return;
 	}
 	notifyThemeChange({ ephemeral: true });
@@ -2339,7 +2447,7 @@ export async function setSymbolPreset(preset: SymbolPreset): Promise<void> {
  * Get the current symbol preset override.
  */
 export function getSymbolPresetOverride(): SymbolPreset | undefined {
-	return currentSymbolPresetOverride;
+	return getSymbolPresetOverrideInternal();
 }
 
 /**
@@ -2347,18 +2455,19 @@ export function getSymbolPresetOverride(): SymbolPreset | undefined {
  * When enabled, uses blue instead of green for diff additions.
  */
 export async function setColorBlindMode(enabled: boolean): Promise<void> {
-	currentColorBlindMode = enabled;
-	if (!currentThemeName) return;
+	setColorBlindModeInternal(enabled);
+	const themeName = getCurrentThemeNameInternal();
+	if (!themeName) return;
 
 	const requestId = ++themeLoadRequestId;
 	try {
-		const loadedTheme = await loadTheme(currentThemeName, getCurrentThemeOptions());
+		const loadedTheme = await loadTheme(themeName, getCurrentThemeOptions());
 		if (requestId !== themeLoadRequestId) return;
-		theme = loadedTheme;
+		setGlobalOrScopedTheme(loadedTheme);
 	} catch {
 		if (requestId !== themeLoadRequestId) return;
 		// Fall back to dark theme
-		theme = await loadTheme("dark", getCurrentThemeOptions());
+		setGlobalOrScopedTheme(await loadTheme("dark", getCurrentThemeOptions()));
 		if (requestId !== themeLoadRequestId) return;
 	}
 	notifyThemeChange({ ephemeral: true });
@@ -2368,15 +2477,13 @@ export async function setColorBlindMode(enabled: boolean): Promise<void> {
  * Get the current color blind mode setting.
  */
 export function getColorBlindMode(): boolean {
-	return currentColorBlindMode;
+	return getColorBlindModeInternal();
 }
 
 export function onThemeChange(callback: (event: ThemeChangeEvent) => void): () => void {
-	onThemeChangeCallback = callback;
+	onThemeChangeCallbacks.add(callback);
 	return () => {
-		if (onThemeChangeCallback === callback) {
-			onThemeChangeCallback = undefined;
-		}
+		onThemeChangeCallbacks.delete(callback);
 	};
 }
 
@@ -2394,7 +2501,7 @@ export function getThemeEpoch(): number {
 /** Bump the theme epoch and notify the registered theme-change listener. */
 function notifyThemeChange(event: ThemeChangeEvent = {}): void {
 	themeEpoch++;
-	onThemeChangeCallback?.(event);
+	for (const callback of onThemeChangeCallbacks) callback(event);
 }
 
 /**
@@ -2411,16 +2518,30 @@ export function isValidSymbolPreset(preset: string): preset is SymbolPreset {
 	return preset === "unicode" || preset === "nerd" || preset === "ascii";
 }
 
+/**
+ * ponytail: one `fs.watch` per process, not per session — a process-level OS
+ * handle that can't be duplicated per AsyncLocalStorage scope the way `theme`
+ * and `currentThemeName` above are (those are plain data, this is a live file
+ * descriptor). In the daemon, each connection's `initTheme(enableWatcher=true,
+ * ...)` calls this and it tears down the previous watcher first
+ * (stopThemeWatcher()) — so if two concurrent sessions both pick custom
+ * (non-builtin) themes, only the most-recently-(re)initialized session's
+ * live-reload-on-file-edit keeps working; the other's silently stops. This
+ * degrades a hot-reload convenience feature only — it does not leak theme
+ * *colors* between sessions, since `theme`/`currentThemeName` are scoped.
+ * Upgrade path: key watchers by theme name in a shared map, or move to a
+ * per-session watcher stored on SessionScope.
+ */
 async function startThemeWatcher(): Promise<void> {
 	stopThemeWatcher();
 
+	const watchedThemeName = getCurrentThemeNameInternal();
 	// Only watch if it's a custom theme (not built-in)
-	if (!currentThemeName || currentThemeName === "dark" || currentThemeName === "light") {
+	if (!watchedThemeName || watchedThemeName === "dark" || watchedThemeName === "light") {
 		return;
 	}
 
 	const customThemesDir = getCustomThemesDir();
-	const watchedThemeName = currentThemeName;
 	const watchedFileName = `${watchedThemeName}.json`;
 	const themeFile = path.join(customThemesDir, watchedFileName);
 
@@ -2437,7 +2558,7 @@ async function startThemeWatcher(): Promise<void> {
 			themeReloadTimer = undefined;
 
 			// Ignore stale timers after switching themes or stopping the watcher
-			if (currentThemeName !== watchedThemeName) {
+			if (getCurrentThemeNameInternal() !== watchedThemeName) {
 				return;
 			}
 
@@ -2448,8 +2569,8 @@ async function startThemeWatcher(): Promise<void> {
 
 			loadTheme(watchedThemeName, getCurrentThemeOptions())
 				.then(loadedTheme => {
-					theme = loadedTheme;
-					notifyThemeChange({ ephemeral: true });
+					setGlobalOrScopedTheme(loadedTheme);
+					notifyThemeChange();
 				})
 				.catch(() => {
 					// Ignore errors (file might be in invalid state while being edited)
@@ -2459,7 +2580,7 @@ async function startThemeWatcher(): Promise<void> {
 
 	try {
 		themeWatcher = fs.watch(customThemesDir, (_eventType, filename) => {
-			if (currentThemeName !== watchedThemeName) {
+			if (getCurrentThemeNameInternal() !== watchedThemeName) {
 				return;
 			}
 			if (!filename) {
@@ -2484,11 +2605,11 @@ async function startThemeWatcher(): Promise<void> {
 function reevaluateAutoTheme(debugLabel: string, event: ThemeChangeEvent = {}): void {
 	if (!autoDetectedTheme) return;
 	const resolved = getDefaultTheme();
-	if (resolved === currentThemeName) return;
-	currentThemeName = resolved;
+	if (resolved === getCurrentThemeNameInternal()) return;
+	setCurrentThemeNameInternal(resolved);
 	loadTheme(resolved, getCurrentThemeOptions())
 		.then(loadedTheme => {
-			theme = loadedTheme;
+			setGlobalOrScopedTheme(loadedTheme);
 			notifyThemeChange(event);
 		})
 		.catch(err => {
@@ -2530,7 +2651,20 @@ function stopMacAppearanceObserver(): void {
 // SIGWINCH Listener
 // ============================================================================
 
-/** Re-check appearance on SIGWINCH and switch dark/light when using auto-detected theme. */
+/**
+ * Re-check appearance on SIGWINCH and switch dark/light when using auto-detected theme.
+ *
+ * ponytail: process-level OS signal, can't be made per-session. Only reachable
+ * with enableWatcher=true, which main.ts passes as `isInteractive` — daemon TUI
+ * sessions get enableWatcher=true too, so each connection's `initTheme` call
+ * re-registers this handler (stopSigwinchListener() first, so no listener
+ * leak). In practice this is inert there: the daemon host process's terminal
+ * is what would raise SIGWINCH, not any client's, and daemon resize instead
+ * arrives per-connection as a FRAME_RESIZE frame (socket-terminal.ts). Upgrade
+ * path if that ever changes: don't call initTheme with enableWatcher=true on
+ * the daemon path, or route resize through a session-scoped callback set
+ * (see session-scope.ts) instead of a process signal.
+ */
 function startSigwinchListener(): void {
 	stopSigwinchListener();
 	sigwinchHandler = () => {
@@ -2806,7 +2940,11 @@ function highlightCached(code: string, validLang: string | undefined, highlightT
  */
 export function highlightCode(code: string, lang?: string, highlightTheme: Theme = theme): string[] {
 	const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
-	const highlighted = highlightCached(code, validLang, highlightTheme);
+	// Resolve the Proxy to the real theme instance before caching — see the
+	// comment on getMarkdownTheme's cache guard for why comparing the Proxy
+	// itself would never invalidate.
+	const resolvedTheme = highlightTheme === theme ? (getTheme() ?? highlightTheme) : highlightTheme;
+	const highlighted = highlightCached(code, validLang, resolvedTheme);
 	// Always return a fresh array: callers (e.g. renderCodeCell) push extra lines
 	// onto the result, which would corrupt the cached string otherwise.
 	return (highlighted ?? code).split("\n");
@@ -2816,7 +2954,7 @@ export function getSymbolTheme(): SymbolTheme {
 	// Guard against `theme` being undefined (pre-init or cross-module-instance
 	// plugin calls). Fall back to the ASCII preset so the returned symbols are
 	// usable instead of crashing. See #2998.
-	if (typeof theme === "undefined") {
+	if (getTheme() === undefined) {
 		const box = {
 			topLeft: "+",
 			topRight: "+",
@@ -2868,7 +3006,13 @@ export function setMarkdownMermaidRendering(enabled: boolean): void {
 }
 
 export function getMarkdownTheme(): MarkdownTheme {
-	if (cachedMarkdownTheme !== undefined && cachedMarkdownThemeRef === theme) {
+	// Compare against the resolved theme (getTheme()), not the `theme` Proxy —
+	// the Proxy's identity never changes (that's what lets every existing
+	// `theme.fg(...)` call site keep working across a session-scoped theme
+	// swap), so comparing the Proxy to itself would always be `true` and this
+	// cache would never invalidate.
+	const resolvedTheme = getTheme();
+	if (cachedMarkdownTheme !== undefined && cachedMarkdownThemeRef === resolvedTheme) {
 		return cachedMarkdownTheme;
 	}
 	const mermaid = markdownMermaidRendering
@@ -2915,20 +3059,20 @@ export function getMarkdownTheme(): MarkdownTheme {
 			: undefined,
 		highlightCode: (code: string, lang?: string): string[] => {
 			const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
-			const highlighted = highlightCached(code, validLang, theme);
+			const highlighted = highlightCached(code, validLang, getTheme() ?? theme);
 			if (highlighted !== null) return highlighted.split("\n");
 			return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
 		},
 	};
 	cachedMarkdownTheme = markdownTheme;
-	cachedMarkdownThemeRef = theme;
+	cachedMarkdownThemeRef = resolvedTheme;
 	return markdownTheme;
 }
 
 export function getSelectListTheme(): SelectListTheme {
 	// Guard against `theme` being undefined (pre-init or cross-module-instance
 	// plugin calls). See #2998.
-	if (typeof theme === "undefined") {
+	if (getTheme() === undefined) {
 		return {
 			selectedPrefix: (text: string) => text,
 			selectedText: (text: string) => text,
@@ -2953,7 +3097,7 @@ export function getSelectListTheme(): SelectListTheme {
 export function getEditorTheme(): EditorTheme {
 	// Guard against `theme` being undefined (pre-init or cross-module-instance
 	// plugin calls). See #2998.
-	if (typeof theme === "undefined") {
+	if (getTheme() === undefined) {
 		return {
 			borderColor: (text: string) => text,
 			selectList: getSelectListTheme(),
@@ -2975,7 +3119,7 @@ export function getSettingsListTheme(): SettingsListTheme {
 	// installs where the live binding was never initialized. Fall back to plain
 	// text so the call returns a usable (unstyled) theme instead of crashing with
 	// "undefined is not an object (evaluating 'theme.fg')". See #2998.
-	if (typeof theme === "undefined") {
+	if (getTheme() === undefined) {
 		return {
 			label: (text: string) => text,
 			value: (text: string) => text,

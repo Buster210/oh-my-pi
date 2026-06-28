@@ -76,40 +76,41 @@ const USER_AGENT_TARGET_TYPES = new Set(["page", "webview", "background_page"]);
 const PUPPETEER_SOURCE_URL_SUFFIX = "//# sourceURL=__puppeteer_evaluation_script__";
 
 /**
- * Lazy-import puppeteer from a safe CWD so cosmiconfig doesn't choke
- * on malformed package.json files in the user's project tree.
- *
- * Dynamic import is required because puppeteer-core probes the cwd at module
- * load time; we must `process.chdir` to a safe scratch dir before loading and
- * restore cwd afterwards. A static import would run at module-init time before
- * cwd is safe.
+ * Lazy-import puppeteer needs a safe CWD: puppeteer-core probes the cwd at
+ * load time and cosmiconfig chokes on malformed package.json in the user's
+ * tree. Patch `process.cwd` to `dir` for the duration of `fn`, then restore
+ * the original getter. Patching the getter (not `process.chdir`) avoids
+ * mutating the real process-wide CWD, which would race concurrent sessions
+ * in a shared daemon and bypass the AsyncLocalStorage cwd scoping (dirs.ts).
  */
+async function withPatchedCwd<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+	const orig = process.cwd;
+	Object.defineProperty(process, "cwd", { value: () => dir, configurable: true });
+	try {
+		return await fn();
+	} finally {
+		Object.defineProperty(process, "cwd", { value: orig, configurable: true });
+	}
+}
+
 let puppeteerModule: typeof Puppeteer | undefined;
 export async function loadPuppeteer(): Promise<typeof Puppeteer> {
 	if (puppeteerModule) return puppeteerModule;
-	const prev = process.cwd();
 	const safeDir = getPuppeteerDir();
 	await Bun.write(path.join(safeDir, "package.json"), "{}");
-	try {
-		process.chdir(safeDir);
+	return withPatchedCwd(safeDir, async () => {
 		puppeteerModule = (await import("puppeteer-core")).default;
 		return puppeteerModule;
-	} finally {
-		process.chdir(prev);
-	}
+	});
 }
 
 let puppeteerModuleWorker: typeof Puppeteer | undefined;
 export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Puppeteer> {
 	if (puppeteerModuleWorker) return puppeteerModuleWorker;
-	const orig = process.cwd;
-	Object.defineProperty(process, "cwd", { value: () => safeDir, configurable: true });
-	try {
+	return withPatchedCwd(safeDir, async () => {
 		puppeteerModuleWorker = (await import("puppeteer-core")).default;
 		return puppeteerModuleWorker;
-	} finally {
-		Object.defineProperty(process, "cwd", { value: orig, configurable: true });
-	}
+	});
 }
 
 let browsersModule: typeof BrowsersNs | undefined;

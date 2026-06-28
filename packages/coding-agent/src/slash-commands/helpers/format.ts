@@ -1,5 +1,5 @@
 import { shimmerText } from "../../modes/theme/shimmer";
-import { theme as currentTheme, type Theme } from "../../modes/theme/theme";
+import { theme as currentTheme, isThemeReady, type Theme } from "../../modes/theme/theme";
 
 /** Format a millisecond duration as a coarse-grained human label. */
 export function formatDuration(ms: number): string {
@@ -28,7 +28,7 @@ const unstyledProgressBarTheme: ProgressBarTheme = {
 };
 
 function resolveProgressBarTheme(uiTheme: ProgressBarTheme | undefined): ProgressBarTheme {
-	return uiTheme ?? currentTheme ?? unstyledProgressBarTheme;
+	return uiTheme ?? (isThemeReady() ? currentTheme : undefined) ?? unstyledProgressBarTheme;
 }
 
 /**

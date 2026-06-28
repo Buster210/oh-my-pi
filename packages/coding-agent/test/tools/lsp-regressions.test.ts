@@ -244,6 +244,44 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	it("stamps each client with its own idle timeout instead of a shared last-write-wins value", async () => {
+		const tempDirA = TempDir.createSync("@omp-lsp-idle-a-");
+		const tempDirB = TempDir.createSync("@omp-lsp-idle-b-");
+		try {
+			const initHandler: FakeLspHandler = (message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				}
+			};
+
+			const config: ServerConfig = {
+				command: "fake-lsp",
+				fileTypes: ["ts"],
+				rootMarkers: [],
+			};
+
+			// Session A configures a short idle timeout, then session B configures a
+			// longer one -- simulating two concurrent daemon sessions with different
+			// `lsp.idleTimeoutMs`. Each client must keep the value active when it spawned.
+			// Re-install the fake server (re-mocks `ptree.spawn`) between clients: each
+			// `getOrCreateClient` needs its own process/stdout, one per fake install.
+			lspClient.setIdleTimeout(1_000);
+			installFakeLsp(initHandler);
+			const clientA = await lspClient.getOrCreateClient(config, tempDirA.path(), 1_000);
+			lspClient.setIdleTimeout(60_000);
+			installFakeLsp(initHandler);
+			const clientB = await lspClient.getOrCreateClient(config, tempDirB.path(), 1_000);
+
+			expect(clientA.idleTimeoutMs).toBe(1_000);
+			expect(clientB.idleTimeoutMs).toBe(60_000);
+		} finally {
+			lspClient.setIdleTimeout(null);
+			await lspClient.shutdownAll();
+			tempDirA.removeSync();
+			tempDirB.removeSync();
+		}
+	}, 15_000);
+
 	it("advertises workspace folder support during LSP initialization", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-workspace-folders-");
 		try {

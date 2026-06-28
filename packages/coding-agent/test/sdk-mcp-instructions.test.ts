@@ -6,6 +6,7 @@ import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -102,6 +103,12 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 			const deadline = Date.now() + 12_000;
 			let prompt = session.systemPrompt.join("\n");
 			while (!prompt.includes(SERVER_INSTRUCTIONS) && Date.now() < deadline) {
+				// Deferred-UI discovery is lazy: the server subprocess spawns only
+				// on first tool access, not when discovery stashes the config.
+				// Keep consuming the trigger the way a real first prompt does
+				// (tool registration reads the manager's tools) — discovery may
+				// stash at any point during this window.
+				MCPManager.instance()?.getTools();
 				await Bun.sleep(50);
 				prompt = session.systemPrompt.join("\n");
 			}

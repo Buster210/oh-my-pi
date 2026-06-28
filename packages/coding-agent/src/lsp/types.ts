@@ -406,6 +406,8 @@ export interface LspClient {
 	status: "connecting" | "ready" | "error";
 	serverCapabilities?: LspServerCapabilities;
 	lastActivity: number;
+	/** Idle timeout for this client's session/cwd config; null/undefined disables idle shutdown. */
+	idleTimeoutMs?: number | null;
 	/** Serializes outbound JSON-RPC writes to the server process. */
 	writeQueue: Promise<void>;
 	/** Tracks active work-done progress tokens from the server */

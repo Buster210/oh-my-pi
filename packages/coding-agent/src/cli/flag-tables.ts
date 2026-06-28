@@ -99,7 +99,14 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		result.config = [...(result.config ?? []), value];
 	},
 	"--mode": (result, value) => {
-		if (value === "text" || value === "json" || value === "rpc" || value === "acp" || value === "rpc-ui") {
+		if (
+			value === "text" ||
+			value === "json" ||
+			value === "rpc" ||
+			value === "acp" ||
+			value === "rpc-ui" ||
+			value === "daemon"
+		) {
 			result.mode = value;
 		}
 	},
@@ -203,6 +210,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 				validValues: ["always-ask", "write", "yolo"],
 			});
 		}
+	},
+	"--daemon-socket": (result, value) => {
+		result.daemonSocket = value;
 	},
 };
 

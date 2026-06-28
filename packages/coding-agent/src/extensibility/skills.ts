@@ -11,6 +11,7 @@ import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
+import { getSessionScope } from "../modes/daemon/session-scope";
 import autoloadTemplate from "../prompts/skills/autoload.md" with { type: "text" };
 import userInvocationTemplate from "../prompts/skills/user-invocation.md" with { type: "text" };
 import type { SkillPromptDetails } from "../session/messages";
@@ -48,11 +49,16 @@ let activeSkills: readonly Skill[] = [];
  * Read by internal URL protocol handlers (skill://).
  */
 export function getActiveSkills(): readonly Skill[] {
-	return activeSkills;
+	return getSessionScope()?.activeSkills ?? activeSkills;
 }
 
 /** Replace the active skill snapshot. Called once per top-level session. */
 export function setActiveSkills(value: readonly Skill[]): void {
+	const scope = getSessionScope();
+	if (scope) {
+		scope.activeSkills = value;
+		return;
+	}
 	activeSkills = value;
 }
 

@@ -113,6 +113,10 @@
           "type": "boolean",
           "description": "Whether OMP should try to connect this server."
         },
+        "lazy": {
+          "type": "boolean",
+          "description": "Whether this server may be lazily deferred at startup (default: true). Set to false to force a real connection as soon as the session starts."
+        },
         "timeout": {
           "type": "number",
           "minimum": 0,

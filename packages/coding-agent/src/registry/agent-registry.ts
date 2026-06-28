@@ -9,6 +9,7 @@
  * revival) and are only removed on explicit release/teardown.
  */
 
+import { getSessionScope } from "../modes/daemon/session-scope";
 import type { AgentSession } from "../session/agent-session";
 import { oneLineLabel } from "../task/types";
 
@@ -66,6 +67,8 @@ export class AgentRegistry {
 	static #global: AgentRegistry | undefined;
 
 	static global(): AgentRegistry {
+		const scoped = getSessionScope()?.agentRegistry;
+		if (scoped) return scoped;
 		if (!AgentRegistry.#global) {
 			AgentRegistry.#global = new AgentRegistry();
 		}

@@ -1,6 +1,7 @@
 import type { ClipboardImage } from "@oh-my-pi/pi-natives";
 import * as native from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
+import { getSessionScope } from "../modes/daemon/session-scope";
 
 /**
  * Run a subprocess and capture its stdout without blocking the event loop.
@@ -115,6 +116,20 @@ export async function readMacFileUrlsFromClipboard(): Promise<string[]> {
  * @param text - UTF-8 text to place on the clipboard.
  */
 export async function copyToClipboard(text: string): Promise<void> {
+	const sink = getSessionScope()?.terminalOut;
+	const encoded = Buffer.from(text).toString("base64");
+	const osc52 = `\x1b]52;c;${encoded}\x07`;
+
+	if (sink) {
+		// Daemon session: the socket carries only key/resize/cwd frames, so
+		// there's no client OS clipboard the host can reach directly. OSC 52
+		// down the sink lands in the client terminal's clipboard; the native
+		// call below would act on the daemon HOST's clipboard instead, which
+		// is wrong (and cross-contaminates unrelated sessions), so skip it.
+		sink(osc52);
+		return;
+	}
+
 	if (process.stdout.isTTY) {
 		const onError = (err: unknown) => {
 			process.stdout.off("error", onError);
@@ -124,8 +139,6 @@ export async function copyToClipboard(text: string): Promise<void> {
 			}
 		};
 		try {
-			const encoded = Buffer.from(text).toString("base64");
-			const osc52 = `\x1b]52;c;${encoded}\x07`;
 			process.stdout.on("error", onError);
 			process.stdout.write(osc52, err => {
 				process.stdout.off("error", onError);

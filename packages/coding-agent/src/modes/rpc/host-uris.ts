@@ -59,10 +59,12 @@ class RpcHostUriProtocolHandler implements ProtocolHandler {
  * Bidirectional bridge that lets the RPC host own a set of URI schemes.
  *
  * The host registers schemes via `set_host_uri_schemes`; the bridge installs
- * a `RpcHostUriProtocolHandler` per scheme into the process-global
- * {@link InternalUrlRouter}. Reads land on the read tool through the existing
- * router; writes are intercepted by the write tool and dispatched through
- * `requestWrite`.
+ * a `RpcHostUriProtocolHandler` per scheme into the {@link InternalUrlRouter}
+ * via `registerScoped`/`unregisterScoped`, which route through this session's
+ * `SessionScope.hostUriHandlers` in the daemon (and the shared table
+ * standalone) so concurrent sessions never clobber each other's scheme. Reads
+ * land on the read tool through the existing router; writes are intercepted
+ * by the write tool and dispatched through `requestWrite`.
  */
 export class RpcHostUriBridge {
 	#output: RpcHostUriOutput;
@@ -104,11 +106,11 @@ export class RpcHostUriBridge {
 
 		for (const previous of this.#definitions.keys()) {
 			if (!normalized.has(previous)) {
-				this.#router.unregister(previous);
+				this.#router.unregisterScoped(previous);
 			}
 		}
 		for (const definition of normalized.values()) {
-			this.#router.register(new RpcHostUriProtocolHandler(definition, this));
+			this.#router.registerScoped(new RpcHostUriProtocolHandler(definition, this));
 		}
 		this.#definitions = normalized;
 		return Array.from(normalized.keys());
@@ -121,7 +123,7 @@ export class RpcHostUriBridge {
 	 */
 	clear(message: string = "Host URI bridge shut down"): void {
 		for (const scheme of this.#definitions.keys()) {
-			this.#router.unregister(scheme);
+			this.#router.unregisterScoped(scheme);
 		}
 		this.#definitions.clear();
 		this.rejectAllPending(message);

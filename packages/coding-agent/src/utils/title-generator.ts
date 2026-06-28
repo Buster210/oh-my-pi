@@ -9,6 +9,7 @@ import type { ModelRegistry } from "../config/model-registry";
 
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import { getSessionScope } from "../modes/daemon/session-scope";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { isTinyTitleLocalModelKey, ONLINE_TINY_TITLE_MODEL_KEY } from "../tiny/models";
@@ -300,11 +301,26 @@ export function formatSessionTerminalTitle(sessionName: string | undefined, cwd?
 }
 
 /**
+ * Write a raw terminal escape sequence to this session's terminal: the daemon
+ * sink when scoped (the client is a real tty there), else `process.stdout`
+ * guarded by the standalone isTTY/headless check — byte-identical outside a
+ * session scope.
+ */
+function writeTerminalEscape(data: string): void {
+	const sink = getSessionScope()?.terminalOut;
+	if (sink) {
+		sink(data);
+		return;
+	}
+	if (!process.stdout.isTTY || isTerminalHeadless()) return;
+	process.stdout.write(data);
+}
+
+/**
  * Set the terminal title using OSC 0 (sets both tab and window title). Unsupported terminals ignore it.
  */
 export function setTerminalTitle(title: string): void {
-	if (!process.stdout.isTTY || isTerminalHeadless()) return;
-	process.stdout.write(`\x1b]0;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE}\x07`);
+	writeTerminalEscape(`\x1b]0;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE}\x07`);
 }
 
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
@@ -315,14 +331,12 @@ export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: s
  * Save the current terminal title on terminals that support xterm window ops.
  */
 export function pushTerminalTitle(): void {
-	if (!process.stdout.isTTY || isTerminalHeadless()) return;
-	process.stdout.write("\x1b[22;2t");
+	writeTerminalEscape("\x1b[22;2t");
 }
 
 /**
  * Restore the previously saved terminal title on terminals that support xterm window ops.
  */
 export function popTerminalTitle(): void {
-	if (!process.stdout.isTTY || isTerminalHeadless()) return;
-	process.stdout.write("\x1b[23;2t");
+	writeTerminalEscape("\x1b[23;2t");
 }

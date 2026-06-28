@@ -11,6 +11,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { SourceMeta } from "../capability/types";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
+import { getSessionScope } from "../modes/daemon/session-scope";
 import type { AuthStorage } from "../session/auth-storage";
 import {
 	connectToServer,
@@ -36,7 +37,7 @@ import { type MCPStoredOAuthCredential, refreshMCPOAuthToken } from "./oauth-flo
 import type { McpConnectionStatusEvent } from "./startup-events";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
-import type { MCPToolCache } from "./tool-cache";
+import type { MCPServerSnapshot, MCPToolCache } from "./tool-cache";
 import type {
 	MCPGetPromptResult,
 	MCPPrompt,
@@ -158,6 +159,8 @@ export interface MCPDiscoverOptions {
 	filterBrowser?: boolean;
 	/** Called when MCP server connection state changes. */
 	onStatus?: (event: McpConnectionStatusEvent) => void;
+	/** Defer actual subprocess spawning until first tool use (saves ~100MB per server at startup). */
+	lazy?: boolean;
 }
 
 /**
@@ -170,11 +173,16 @@ export class MCPManager {
 
 	/** Process-global instance shared by internal URL protocol handlers and tools. */
 	static instance(): MCPManager | undefined {
-		return MCPManager.#instance;
+		return getSessionScope()?.mcpManager ?? MCPManager.#instance;
 	}
 
 	/** Install or clear the process-global instance. */
 	static setInstance(value: MCPManager | undefined): void {
+		const scope = getSessionScope();
+		if (scope) {
+			scope.mcpManager = value;
+			return;
+		}
 		MCPManager.#instance = value;
 	}
 
@@ -207,6 +215,13 @@ export class MCPManager {
 	#reconnectHistory = new Map<string, number[]>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
 	#epoch = 0;
+	#deferredConfigs = new Map<string, { config: MCPServerConfig; source?: SourceMeta }>();
+	/**
+	 * Cached instructions/prompts/resources for deferred servers, served
+	 * transparently until the real connection replaces them.
+	 */
+	#deferredSnapshots = new Map<string, MCPServerSnapshot>();
+	#lazyConnectTriggered = false;
 
 	constructor(
 		private cwd: string,
@@ -270,7 +285,10 @@ export class MCPManager {
 				this.#subscribedResources.set(name, new Set(uris));
 			})
 			.catch(error => {
-				logger.debug("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
+				logger.debug("Failed to subscribe to MCP resources", {
+					path: `mcp:${name}`,
+					error,
+				});
 			});
 	}
 
@@ -298,7 +316,10 @@ export class MCPManager {
 			const uris = this.#subscribedResources.get(name);
 			if (uris && uris.size > 0) {
 				void unsubscribeFromResources(connection, Array.from(uris)).catch(error => {
-					logger.debug("Failed to unsubscribe MCP resources", { path: `mcp:${name}`, error });
+					logger.debug("Failed to unsubscribe MCP resources", {
+						path: `mcp:${name}`,
+						error,
+					});
 				});
 			}
 		}
@@ -326,11 +347,15 @@ export class MCPManager {
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			options?.onStatus?.({ type: "failed", serverName: ".mcp.json", error: message });
+			options?.onStatus?.({
+				type: "failed",
+				serverName: ".mcp.json",
+				error: message,
+			});
 			throw error;
 		}
 		const { configs, exaApiKeys, sources } = loadedConfigs;
-		const result = await this.connectServers(configs, sources, options?.onStatus);
+		const result = await this.connectServers(configs, sources, options?.onStatus, options?.lazy);
 		result.exaApiKeys = exaApiKeys;
 		return result;
 	}
@@ -343,6 +368,7 @@ export class MCPManager {
 		configs: Record<string, MCPServerConfig>,
 		sources: Record<string, SourceMeta>,
 		onStatus?: (event: McpConnectionStatusEvent) => void,
+		lazy?: boolean,
 	): Promise<MCPLoadResult> {
 		type ConnectionTask = {
 			name: string;
@@ -355,6 +381,10 @@ export class MCPManager {
 		const connectedServers = new Set<string>();
 		const allTools: CustomTool<TSchema, MCPToolDetails>[] = [];
 		const reportedErrors = new Set<string>();
+		// Suppresses background failure logging until the initial connection
+		// storm settles (flips true below), so fast failures already surfaced
+		// via the returned `errors` map / `onStatus` don't also spam the log;
+		// failures that land after this function returns still get logged.
 		let allowBackgroundLogging = false;
 		const statusServerNames: string[] = [];
 		const validationFailures: Array<{ name: string; message: string }> = [];
@@ -401,6 +431,29 @@ export class MCPManager {
 			// and falls back to cached/deferred tools.
 			this.#serverConfigs.set(name, config);
 
+			// Lazy mode: defer actual connection until first tool use. Once the
+			// lazy window has passed (#ensureConnected already ran and will not
+			// run again), stashing would strand the server — connect eagerly.
+			// Deferring is only sound when cached TOOL definitions exist to stand
+			// in as placeholders: tool calls are the only automatic wake trigger,
+			// so a server with no cached tools (cold cache, or prompts/resources-
+			// only) would strand — zero registered tools, nothing to ever trigger
+			// the deferred connect, "connecting" status never resolves. Those
+			// connect eagerly (populating the cache so later runs defer).
+			// `lazy: false` in a server's config opts it out of deferral entirely.
+			if (lazy && !this.#lazyConnectTriggered && config.lazy !== false) {
+				const cached = await this.toolCache?.get(name, config);
+				if (cached && cached.tools.length > 0) {
+					this.#deferredConfigs.set(name, { config, source: sources[name] });
+					this.#deferredSnapshots.set(name, cached);
+					// Deferred servers are not connecting — drop the name pushed
+					// above so the UI status line doesn't wait on them forever.
+					statusServerNames.pop();
+					allTools.push(...this.#toDeferredTools(name, cached.tools, sources[name]));
+					continue;
+				}
+			}
+
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			const connectionPromise = (async () => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
@@ -435,7 +488,9 @@ export class MCPManager {
 						lookupMcpOAuthCredential(this.#authStorage, config)
 					) {
 						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
+							const refreshed = await this.#resolveAuthConfig(config, {
+								forceRefresh: true,
+							});
 							if (refreshed.type === "http" || refreshed.type === "sse") {
 								return refreshed.headers ?? null;
 							}
@@ -446,7 +501,9 @@ export class MCPManager {
 					// Re-establish connection if the transport closes (server restart,
 					// network interruption).
 					connection.transport.onClose = () => {
-						logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
+						logger.debug("MCP transport lost, triggering reconnect", {
+							path: `mcp:${name}`,
+						});
 						void this.reconnectServer(name);
 					};
 
@@ -479,9 +536,13 @@ export class MCPManager {
 					this.#replaceServerTools(name, customTools);
 					this.#onToolsChanged?.(this.#tools);
 					void this.toolCache?.set(name, config, serverTools);
+					this.#deferredSnapshots.delete(name);
 
 					onStatus?.({ type: "connected", serverName: name });
 					await this.#loadServerResourcesAndPrompts(name, connection);
+					// Now that instructions/prompts/resources are live, snapshot the
+					// full advertisement so future sessions can serve it while deferred.
+					this.#snapshotSuccess(name, config, connection, serverTools);
 				})
 				.catch(error => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
@@ -515,7 +576,7 @@ export class MCPManager {
 					pendingTasks.map(async task => {
 						const cached = await this.toolCache?.get(task.name, task.config);
 						if (cached) {
-							cachedTools.set(task.name, cached);
+							cachedTools.set(task.name, cached.tools);
 						}
 					}),
 				);
@@ -526,8 +587,7 @@ export class MCPManager {
 			// (issue #2100: a single unresponsive MCP server blocked startup for the
 			// full 30 s `OMP_MCP_TIMEOUT_MS`). Leave them in flight — the background
 			// `void toolsPromise.then(...)` chain above registers their tools and
-			// fires `#onToolsChanged` once the connect finishes, or logs the failure
-			// after `allowBackgroundLogging` flips below.
+			// fires `#onToolsChanged` once the connect finishes, or logs the failure.
 
 			for (const task of connectionTasks) {
 				const { name } = task;
@@ -547,10 +607,7 @@ export class MCPManager {
 					const cached = cachedTools.get(name);
 					if (cached) {
 						const source = this.#sources.get(name);
-						const reconnect = () => this.reconnectServer(name);
-						allTools.push(
-							...DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
-						);
+						allTools.push(...this.#toDeferredTools(name, cached, source));
 					}
 				}
 			}
@@ -570,6 +627,27 @@ export class MCPManager {
 			connectedServers: Array.from(connectedServers),
 			exaApiKeys: [], // Will be populated by discoverAndConnect
 		};
+	}
+
+	/** Build deferred (lazy-wake) tool wrappers for a server, sharing the reconnect closure. */
+	#toDeferredTools(name: string, tools: MCPToolDefinition[], source?: SourceMeta): DeferredMCPTool[] {
+		const reconnect = () => this.reconnectServer(name);
+		return DeferredMCPTool.fromTools(name, tools, () => this.waitForConnection(name), source, reconnect);
+	}
+
+	/** Snapshot the full tool/instructions/prompts/resources advertisement once resources+prompts are loaded. */
+	#snapshotSuccess(
+		name: string,
+		config: MCPServerConfig,
+		connection: MCPServerConnection,
+		serverTools: MCPToolDefinition[],
+	): void {
+		void this.toolCache?.set(name, config, serverTools, {
+			instructions: connection.instructions,
+			prompts: connection.prompts,
+			resources: connection.resources,
+			resourceTemplates: connection.resourceTemplates,
+		});
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
@@ -592,11 +670,18 @@ export class MCPManager {
 			}
 		})();
 		void refresh.catch(error => {
-			logger.debug("Failed MCP notification refresh", { path: `mcp:${serverName}`, kind, error });
+			logger.debug("Failed MCP notification refresh", {
+				path: `mcp:${serverName}`,
+				kind,
+				error,
+			});
 		});
 	}
 	#handleServerNotification(serverName: string, method: string, params: unknown): void {
-		logger.debug("MCP notification received", { path: `mcp:${serverName}`, method });
+		logger.debug("MCP notification received", {
+			path: `mcp:${serverName}`,
+			method,
+		});
 
 		switch (method) {
 			case MCPNotificationMethods.TOOLS_LIST_CHANGED:
@@ -647,9 +732,30 @@ export class MCPManager {
 	}
 
 	/**
+	 * Ensure all deferred servers are connected. Called lazily on first tool use.
+	 */
+	async #ensureConnected(): Promise<void> {
+		if (this.#deferredConfigs.size === 0) return;
+		if (this.#lazyConnectTriggered) return;
+		this.#lazyConnectTriggered = true;
+
+		const configs: Record<string, MCPServerConfig> = {};
+		const sources: Record<string, SourceMeta> = {};
+		for (const [name, { config, source }] of this.#deferredConfigs) {
+			configs[name] = config;
+			if (source) sources[name] = source;
+		}
+		this.#deferredConfigs.clear();
+
+		// Connect in background - tools will be available via #onToolsChanged
+		void this.connectServers(configs, sources);
+	}
+
+	/**
 	 * Get all loaded tools.
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
+		void this.#ensureConnected();
 		return this.#tools;
 	}
 
@@ -696,6 +802,10 @@ export class MCPManager {
 	 * Wait for a connection to complete (or fail).
 	 */
 	async waitForConnection(name: string): Promise<MCPServerConnection> {
+		if (this.#deferredConfigs.has(name)) {
+			await this.#ensureConnected();
+		}
+
 		const connection = this.#connections.get(name);
 		if (connection) return connection;
 		const pending = this.#pendingConnections.get(name);
@@ -903,7 +1013,10 @@ export class MCPManager {
 			}
 			try {
 				const connection = await this.#connectAndWireServer(name, config, source, reconnectEpoch);
-				logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
+				logger.debug("MCP reconnected", {
+					path: `mcp:${name}`,
+					tools: connection.tools?.length ?? 0,
+				});
 				return connection;
 			} catch (error) {
 				if (this.#epoch !== reconnectEpoch) {
@@ -924,7 +1037,10 @@ export class MCPManager {
 					});
 					await Bun.sleep(delays[attempt]);
 				} else {
-					logger.error("MCP reconnect failed after retries", { path: `mcp:${name}`, error: msg });
+					logger.error("MCP reconnect failed after retries", {
+						path: `mcp:${name}`,
+						error: msg,
+					});
 					// Don't remove stale tools — keep them in the registry so they
 					// remain selected. Calls will fail with MCP errors, which
 					// triggers the tool-level reconnect, or the user can run
@@ -968,7 +1084,9 @@ export class MCPManager {
 		// Same gate as connectServers: any resolvable managed credential.
 		if (isAuthRefreshableMCPTransport(connection.transport) && lookupMcpOAuthCredential(this.#authStorage, config)) {
 			connection.transport.onAuthError = async () => {
-				const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
+				const refreshed = await this.#resolveAuthConfig(config, {
+					forceRefresh: true,
+				});
 				if (refreshed.type === "http" || refreshed.type === "sse") {
 					return refreshed.headers ?? null;
 				}
@@ -976,7 +1094,9 @@ export class MCPManager {
 			};
 		}
 		connection.transport.onClose = () => {
-			logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
+			logger.debug("MCP transport lost, triggering reconnect", {
+				path: `mcp:${name}`,
+			});
 			void this.reconnectServer(name);
 		};
 		try {
@@ -986,7 +1106,10 @@ export class MCPManager {
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
-			void this.#loadServerResourcesAndPrompts(name, connection);
+			this.#deferredSnapshots.delete(name);
+			void this.#loadServerResourcesAndPrompts(name, connection).then(() => {
+				this.#snapshotSuccess(name, config, connection, serverTools);
+			});
 			return connection;
 		} catch (error) {
 			// Clean up the connection to avoid zombie transports
@@ -1012,7 +1135,10 @@ export class MCPManager {
 					this.#subscribeAndTrack(name, connection, uris, notificationEpoch);
 				}
 			} catch (error) {
-				logger.debug("Failed to load MCP resources", { path: `mcp:${name}`, error });
+				logger.debug("Failed to load MCP resources", {
+					path: `mcp:${name}`,
+					error,
+				});
 			}
 		}
 
@@ -1021,7 +1147,10 @@ export class MCPManager {
 				await listPrompts(connection);
 				this.#onPromptsChanged?.(name);
 			} catch (error) {
-				logger.debug("Failed to load MCP prompts", { path: `mcp:${name}`, error });
+				logger.debug("Failed to load MCP prompts", {
+					path: `mcp:${name}`,
+					error,
+				});
 			}
 		}
 	}
@@ -1084,7 +1213,10 @@ export class MCPManager {
 						try {
 							await unsubscribeFromResources(connection, removed);
 						} catch (error) {
-							logger.debug("Failed to unsubscribe stale MCP resources", { path: `mcp:${name}`, error });
+							logger.debug("Failed to unsubscribe stale MCP resources", {
+								path: `mcp:${name}`,
+								error,
+							});
 						}
 					}
 				}
@@ -1109,7 +1241,10 @@ export class MCPManager {
 					}
 					this.#subscribedResources.set(name, newUris);
 				} catch (error) {
-					logger.debug("Failed to re-subscribe to MCP resources", { path: `mcp:${name}`, error });
+					logger.debug("Failed to re-subscribe to MCP resources", {
+						path: `mcp:${name}`,
+						error,
+					});
 				}
 			}
 		};
@@ -1142,7 +1277,14 @@ export class MCPManager {
 	 */
 	getServerResources(name: string): { resources: MCPResource[]; templates: MCPResourceTemplate[] } | undefined {
 		const connection = this.#connections.get(name);
-		if (!connection) return undefined;
+		if (!connection) {
+			const snapshot = this.#deferredSnapshots.get(name);
+			if (!snapshot) return undefined;
+			return {
+				resources: snapshot.resources ?? [],
+				templates: snapshot.resourceTemplates ?? [],
+			};
+		}
 		return {
 			resources: connection.resources ?? [],
 			templates: connection.resourceTemplates ?? [],
@@ -1150,14 +1292,15 @@ export class MCPManager {
 	}
 
 	/**
-	 * Read a specific resource from a server.
+	 * Read a specific resource from a server. Wakes a deferred server —
+	 * listings serve from the cached snapshot, content needs the live server.
 	 */
 	async readServerResource(
 		name: string,
 		uri: string,
 		options?: MCPRequestOptions,
 	): Promise<MCPResourceReadResult | undefined> {
-		const connection = this.#connections.get(name);
+		const connection = await this.#connectionOrWake(name);
 		if (!connection) return undefined;
 		return readResource(connection, uri, options);
 	}
@@ -1167,12 +1310,13 @@ export class MCPManager {
 	 */
 	getServerPrompts(name: string): MCPPrompt[] | undefined {
 		const connection = this.#connections.get(name);
-		if (!connection) return undefined;
+		if (!connection) return this.#deferredSnapshots.get(name)?.prompts;
 		return connection.prompts ?? [];
 	}
 
 	/**
-	 * Get a specific prompt from a server.
+	 * Get a specific prompt from a server. Wakes a deferred server — the
+	 * template body always comes from the live connection.
 	 */
 	async executePrompt(
 		name: string,
@@ -1180,13 +1324,27 @@ export class MCPManager {
 		args?: Record<string, string>,
 		options?: MCPRequestOptions,
 	): Promise<MCPGetPromptResult | undefined> {
-		const connection = this.#connections.get(name);
+		const connection = await this.#connectionOrWake(name);
 		if (!connection) return undefined;
 		return getPrompt(connection, promptName, args, options);
 	}
 
+	/** Live connection, or wake a deferred server and wait for it. */
+	async #connectionOrWake(name: string): Promise<MCPServerConnection | undefined> {
+		const connection = this.#connections.get(name);
+		if (connection) return connection;
+		if (!this.#deferredConfigs.has(name)) return undefined;
+		try {
+			return await this.waitForConnection(name);
+		} catch {
+			return undefined;
+		}
+	}
+
 	/**
-	 * Get all server instructions (for system prompt injection).
+	 * Get all server instructions (for system prompt injection). Deferred
+	 * servers serve their cached instructions so the model is guided
+	 * identically whether or not the server has been woken yet.
 	 */
 	getServerInstructions(): Map<string, string> {
 		const instructions = new Map<string, string>();
@@ -1195,13 +1353,21 @@ export class MCPManager {
 				instructions.set(name, connection.instructions);
 			}
 		}
+		for (const [name, snapshot] of this.#deferredSnapshots) {
+			if (!this.#connections.has(name) && snapshot.instructions) {
+				instructions.set(name, snapshot.instructions);
+			}
+		}
 		return instructions;
 	}
 
 	/**
 	 * Get notification state for display.
 	 */
-	getNotificationState(): { enabled: boolean; subscriptions: Map<string, ReadonlySet<string>> } {
+	getNotificationState(): {
+		enabled: boolean;
+		subscriptions: Map<string, ReadonlySet<string>>;
+	} {
 		return {
 			enabled: this.#notificationsEnabled,
 			subscriptions: this.#subscribedResources as Map<string, ReadonlySet<string>>,
@@ -1317,7 +1483,10 @@ export class MCPManager {
 					}
 				}
 			} catch (error) {
-				logger.warn("Failed to resolve OAuth credential", { credentialId, error });
+				logger.warn("Failed to resolve OAuth credential", {
+					credentialId,
+					error,
+				});
 			}
 		}
 

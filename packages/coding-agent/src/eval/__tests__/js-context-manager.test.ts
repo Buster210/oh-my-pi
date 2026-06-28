@@ -289,3 +289,55 @@ describe("JavaScript eval worker lifecycle", () => {
 		expect(stats.terminateCalls).toBe(1);
 	});
 });
+describe("concurrent daemon sessions — js eval parity", () => {
+	let restoreCloseTimeoutMs = 0;
+	beforeEach(() => {
+		restoreCloseTimeoutMs = setWorkerCloseTimeoutMsForTests(1);
+	});
+
+	afterEach(async () => {
+		await disposeAllVmContexts();
+		setWorkerCloseTimeoutMsForTests(restoreCloseTimeoutMs);
+	});
+
+	it("two concurrent sessions each run JS eval without owner-conflict throws", async () => {
+		using dirA = TempDir.createSync("@omp-js-concurrent-a-");
+		using dirB = TempDir.createSync("@omp-js-concurrent-b-");
+		const sessionA = makeSession(dirA.path());
+		const sessionB = makeSession(dirB.path());
+		const idA = `concurrent-a:${crypto.randomUUID()}`;
+		const idB = `concurrent-b:${crypto.randomUUID()}`;
+
+		// Both sessions run concurrently — neither should throw "Cannot ... while another
+		// same-realm JS runtime is running" because each gets its own Worker thread.
+		const [resultA, resultB] = await Promise.all([
+			executeJs("return 'hello-from-a';", { cwd: dirA.path(), sessionId: idA, session: sessionA }),
+			executeJs("return 'hello-from-b';", { cwd: dirB.path(), sessionId: idB, session: sessionB }),
+		]);
+
+		expect(resultA.exitCode).toBe(0);
+		expect(resultA.output.trim()).toBe("hello-from-a");
+		expect(resultB.exitCode).toBe(0);
+		expect(resultB.output.trim()).toBe("hello-from-b");
+	});
+
+	it("each session sees its own cwd, not the other's or the daemon's", async () => {
+		using dirA = TempDir.createSync("@omp-js-cwd-a-");
+		using dirB = TempDir.createSync("@omp-js-cwd-b-");
+		const sessionA = makeSession(dirA.path());
+		const sessionB = makeSession(dirB.path());
+		const idA = `cwd-a:${crypto.randomUUID()}`;
+		const idB = `cwd-b:${crypto.randomUUID()}`;
+
+		// __omp_session__.cwd is set by the worker thread from the SessionSnapshot.
+		const [resultA, resultB] = await Promise.all([
+			executeJs("return __omp_session__.cwd;", { cwd: dirA.path(), sessionId: idA, session: sessionA }),
+			executeJs("return __omp_session__.cwd;", { cwd: dirB.path(), sessionId: idB, session: sessionB }),
+		]);
+
+		expect(resultA.exitCode).toBe(0);
+		expect(resultA.output.trim()).toBe(dirA.path());
+		expect(resultB.exitCode).toBe(0);
+		expect(resultB.output.trim()).toBe(dirB.path());
+	});
+});

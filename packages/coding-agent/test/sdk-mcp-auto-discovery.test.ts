@@ -103,7 +103,10 @@ describe("createAgentSession deferred MCP auto discovery", () => {
 		writeMcpConfig();
 		// A small explicit toolset keeps the pre-discovery registry far below the
 		// 40-tool auto threshold; the fixture's 45 tools must push it across.
-		const { session } = await createAgentSession({ ...baseOptions(), toolNames: ["read", "edit", "bash"] });
+		const { session, mcpManager } = await createAgentSession({
+			...baseOptions(),
+			toolNames: ["read", "edit", "bash"],
+		});
 		try {
 			// Genuine integration wait: discovery spawns the fixture as a real
 			// subprocess and connects asynchronously, and the SDK fires that work
@@ -112,6 +115,10 @@ describe("createAgentSession deferred MCP auto discovery", () => {
 			// a generous ceiling, exiting the instant discovery flips on.
 			const deadline = Date.now() + 30_000;
 			while (!session.isMCPDiscoveryEnabled() && Date.now() < deadline) {
+				// Deferred-UI discovery is lazy: the fixture subprocess spawns on
+				// first tool access, not when discovery stashes the config. Keep
+				// consuming the trigger the way a real first prompt does.
+				mcpManager?.getTools();
 				await Bun.sleep(50);
 			}
 
@@ -173,6 +180,9 @@ describe("createAgentSession deferred MCP auto discovery", () => {
 			// with a generous ceiling, exiting the instant discovery flips on.
 			const deadline = Date.now() + 30_000;
 			while (!session.isMCPDiscoveryEnabled() && Date.now() < deadline) {
+				// Lazy deferred discovery: consume the first-tool-access trigger
+				// so the stashed config actually connects (see test above).
+				mcpManager.getTools();
 				await Bun.sleep(50);
 			}
 			expect(session.isMCPDiscoveryEnabled()).toBe(true);

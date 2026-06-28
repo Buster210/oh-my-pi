@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -869,15 +868,8 @@ async function renderNotebookPayload(bytes: Uint8Array, displayUrl: string): Pro
 
 async function renderSqlitePayload(bytes: Uint8Array): Promise<string> {
 	return withTempBinaryFile("omp-url-sqlite-", ".sqlite", bytes, async tempPath => {
-		let db: Database | null = null;
-		try {
-			db = new Database(tempPath, { readonly: true, strict: true });
-			db.run("PRAGMA busy_timeout = 3000");
-			const listLimit = applyListLimit(listTables(db), { limit: URL_SQLITE_LIST_LIMIT });
-			return renderTableList(listLimit.items);
-		} finally {
-			db?.close();
-		}
+		const listLimit = applyListLimit(await listTables(tempPath), { limit: URL_SQLITE_LIST_LIMIT });
+		return renderTableList(listLimit.items);
 	});
 }
 

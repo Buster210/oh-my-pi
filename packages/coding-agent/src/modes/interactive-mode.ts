@@ -22,6 +22,7 @@ import type {
 	NativeScrollbackLiveRegion,
 	OverlayHandle,
 	SlashCommand,
+	Terminal,
 } from "@oh-my-pi/pi-tui";
 import {
 	Container,
@@ -533,6 +534,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#planReviewOverlayHandle: OverlayHandle | undefined;
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
 	mcpManager?: MCPManager;
+	titleSystemPrompt?: string;
 	readonly #toolUiContextSetter: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
 
 	readonly #btwController: BtwController;
@@ -609,6 +611,34 @@ export class InteractiveMode implements InteractiveModeContext {
 	#mcpFailedServers = new Map<string, string>();
 	#welcomeComponent?: WelcomeComponent;
 	readonly #chatHost: ChatBlockHost = { requestRender: () => this.ui.requestRender() };
+	/** Injected terminal (daemon/socket-backed). Omitted → standalone ProcessTerminal,
+	 *  byte-identical to today's behavior. */
+	#injectedTerminal?: Terminal;
+	/** Called instead of postmortem.quit(0) when running under an injected terminal
+	 *  — ends only this connection, never the shared host process. */
+	#onExit?: () => void;
+
+	/**
+	 * Resolve the Terminal to hand TUI. Standalone: a fresh ProcessTerminal,
+	 * unchanged from historical behavior. Injected: the given Terminal, with
+	 * its `start` method rebound (not Proxy-wrapped — a Proxy breaks native
+	 * `#private` field access inside Terminal implementations, since private
+	 * fields brand-check the receiver) so TUI's own
+	 * `terminal.start(onInput, onResize)` call also drives this instance's
+	 * editor-height/border resize handler — the injected transport has no
+	 * `process.stdout` "resize" event to hang that logic off of.
+	 */
+	#terminalForTUI(): Terminal {
+		const terminal = this.#injectedTerminal;
+		if (!terminal) return new ProcessTerminal();
+		const originalStart = terminal.start.bind(terminal);
+		terminal.start = (onInput: (data: string) => void, onResize: () => void) =>
+			originalStart(onInput, () => {
+				onResize();
+				this.#resizeHandler?.();
+			});
+		return terminal;
+	}
 
 	constructor(
 		session: AgentSession,
@@ -618,6 +648,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
 		eventBus?: EventBus,
+		titleSystemPrompt?: string,
+		terminal?: Terminal,
+		onExit?: () => void,
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
@@ -630,6 +663,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.lspServers = lspServers;
 		this.mcpManager = mcpManager;
 		this.#eventBus = eventBus;
+		this.titleSystemPrompt = titleSystemPrompt;
+		this.#injectedTerminal = terminal;
+		this.#onExit = onExit;
+		// Mirror the same connection-scoped exit into the session's `shutdown`
+		// extension command, so it also ends only this connection under the daemon.
+		session.setOnExit?.(onExit);
 		if (eventBus) {
 			this.#eventBusUnsubscribers.push(
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
@@ -650,7 +689,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		setTuiTight(settings.get("tui.tight"));
 		setMarkdownMermaidRendering(settings.get("tui.renderMermaid"));
-		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
+		this.ui = new TUI(this.#terminalForTUI(), settings.get("showHardwareCursor"));
 		this.ui.setMaxInlineImages(settings.get("tui.maxInlineImages"));
 		// OSC 66 text-sizing is Kitty-only; resolve the setting against the terminal's
 		// capability (`TERMINAL.textSizing` defaults on for Kitty) so it stays off
@@ -680,7 +719,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#syncEditorMaxHeight();
 			this.ui.requestRender();
 		};
-		process.stdout.on("resize", this.#resizeHandler);
+		// Standalone (no injected terminal): resize comes from the real OS SIGWINCH
+		// via process.stdout. An injected terminal has no such event — its resize
+		// is instead spliced into TUI's own terminal.start() callback by
+		// #terminalForTUI() below, so this stays the default-only listener.
+		if (!this.#injectedTerminal) {
+			process.stdout.on("resize", this.#resizeHandler);
+		}
 		try {
 			this.historyStorage = HistoryStorage.open();
 			this.editor.setHistoryStorage(this.historyStorage);
@@ -743,7 +788,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#todoCommandController = new TodoCommandController(this);
 		this.#selectorController = new SelectorController(this);
 		this.#focusController = new SessionFocusController(this);
-		this.#inputController = new InputController(this);
+		this.#inputController = new InputController(this, undefined, this.#onExit);
 		this.#observerRegistry = new SessionObserverRegistry();
 	}
 
@@ -3464,10 +3509,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sessionId = this.sessionManager.getSessionId();
 		const sessionFile = this.sessionManager.getSessionFile();
 		if (sessionId && sessionFile) {
-			process.stderr.write(`\n${chalk.dim(`Resume this session with ${APP_NAME} --resume ${sessionId}`)}\n`);
+			const hint = `\n${chalk.dim(`Resume this session with ${APP_NAME} --resume ${sessionId}`)}\n`;
+			if (this.#injectedTerminal) this.#injectedTerminal.write(hint);
+			else process.stderr.write(hint);
 		}
 
-		await postmortem.quit(0);
+		// Under an injected terminal (daemon), postmortem.quit(0) would call
+		// process.exit and kill the shared host for every connected client.
+		// onExit ends only this connection; the default path is unchanged.
+		if (this.#onExit) this.#onExit();
+		else await postmortem.quit(0);
 	}
 
 	async checkShutdownRequested(): Promise<void> {

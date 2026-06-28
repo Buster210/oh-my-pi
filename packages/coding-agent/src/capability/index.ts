@@ -6,6 +6,7 @@
  * - Registering providers (where to find it)
  * - Loading items for a capability across all providers
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
@@ -35,12 +36,23 @@ const providerCapabilities = new Map<string, Set<string>>();
 
 /** Provider display metadata (shared across capabilities) */
 const providerMeta = new Map<string, { displayName: string; description: string }>();
+/** Per-session mutable state (settings + disabled providers). */
+export interface CapabilityContext {
+	settings: Settings | null;
+	disabledProviders: Set<string>;
+}
 
-/** Disabled providers (by ID) */
-const disabledProviders = new Set<string>();
+const capabilityALS = new AsyncLocalStorage<CapabilityContext>();
 
-/** Settings manager for persistence (if set) */
-let settings: Settings | null = null;
+/** Fallback when no ALS store is active — preserves single-process behaviour. */
+const defaultContext: CapabilityContext = {
+	settings: null,
+	disabledProviders: new Set<string>(),
+};
+
+function currentContext(): CapabilityContext {
+	return capabilityALS.getStore() ?? defaultContext;
+}
 
 // =============================================================================
 // Registration API
@@ -109,7 +121,7 @@ async function loadImpl<T>(
 	const contributingProviders: string[] = [];
 	const disabledExtensionIds = options.includeDisabled
 		? new Set<string>()
-		: new Set<string>(options.disabledExtensions ?? settings?.get("disabledExtensions") ?? []);
+		: new Set<string>(options.disabledExtensions ?? currentContext().settings?.get("disabledExtensions") ?? []);
 
 	const results = await Promise.all(
 		providers.map(async provider => {
@@ -208,7 +220,7 @@ async function loadImpl<T>(
  * Filter providers based on options and disabled state.
  */
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
-	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledProviders.has(p.id));
+	let providers = (capability.providers as Provider<T>[]).filter(p => !currentContext().disabledProviders.has(p.id));
 
 	if (options.providers) {
 		const allowed = new Set(options.providers);
@@ -249,12 +261,12 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
  * Call this once on startup to enable persistent provider state.
  */
 export function initializeWithSettings(activeSettings: Settings): void {
-	settings = activeSettings;
-	// Load disabled providers from settings
-	const disabled = settings.get("disabledProviders");
-	disabledProviders.clear();
+	const ctx = currentContext();
+	ctx.settings = activeSettings;
+	const disabled = ctx.settings.get("disabledProviders");
+	ctx.disabledProviders.clear();
 	for (const id of disabled) {
-		disabledProviders.add(id);
+		ctx.disabledProviders.add(id);
 	}
 }
 
@@ -262,8 +274,9 @@ export function initializeWithSettings(activeSettings: Settings): void {
  * Persist current disabled providers to settings.
  */
 function persistDisabledProviders(): void {
-	if (settings) {
-		settings.set("disabledProviders", Array.from(disabledProviders));
+	const ctx = currentContext();
+	if (ctx.settings) {
+		ctx.settings.set("disabledProviders", Array.from(ctx.disabledProviders));
 	}
 }
 
@@ -271,7 +284,7 @@ function persistDisabledProviders(): void {
  * Disable a provider globally (across all capabilities).
  */
 export function disableProvider(providerId: string): void {
-	disabledProviders.add(providerId);
+	currentContext().disabledProviders.add(providerId);
 	persistDisabledProviders();
 }
 
@@ -279,7 +292,7 @@ export function disableProvider(providerId: string): void {
  * Enable a previously disabled provider.
  */
 export function enableProvider(providerId: string): void {
-	disabledProviders.delete(providerId);
+	currentContext().disabledProviders.delete(providerId);
 	persistDisabledProviders();
 }
 
@@ -287,23 +300,24 @@ export function enableProvider(providerId: string): void {
  * Check if a provider is enabled.
  */
 export function isProviderEnabled(providerId: string): boolean {
-	return !disabledProviders.has(providerId);
+	return !currentContext().disabledProviders.has(providerId);
 }
 
 /**
  * Get list of all disabled provider IDs.
  */
 export function getDisabledProviders(): string[] {
-	return Array.from(disabledProviders);
+	return Array.from(currentContext().disabledProviders);
 }
 
 /**
  * Set disabled providers from a list (replaces current set).
  */
 export function setDisabledProviders(providerIds: string[]): void {
-	disabledProviders.clear();
+	const ctx = currentContext();
+	ctx.disabledProviders.clear();
 	for (const id of providerIds) {
-		disabledProviders.add(id);
+		ctx.disabledProviders.add(id);
 	}
 	persistDisabledProviders();
 }
@@ -342,7 +356,7 @@ export function getCapabilityInfo(capabilityId: string): CapabilityInfo | undefi
 			displayName: p.displayName,
 			description: p.description,
 			priority: p.priority,
-			enabled: !disabledProviders.has(p.id),
+			enabled: !currentContext().disabledProviders.has(p.id),
 		})),
 	};
 }
@@ -379,7 +393,7 @@ export function getProviderInfo(providerId: string): ProviderInfo | undefined {
 		description: meta.description,
 		priority,
 		capabilities: Array.from(caps),
-		enabled: !disabledProviders.has(providerId),
+		enabled: !currentContext().disabledProviders.has(providerId),
 	};
 }
 
@@ -427,6 +441,16 @@ export function invalidate(filePath: string, cwd?: string): void {
  */
 export function cacheStats(): { content: number; dir: number } {
 	return fsCacheStats();
+}
+
+/**
+ * Run `fn` within its own capability context. The daemon will call this to
+ * isolate each hosted session's settings and disabled-provider set.
+ * Without an explicit call, all code reads the default context (identical
+ * to today's single-process behaviour).
+ */
+export function runWithCapabilityContext<T>(ctx: CapabilityContext, fn: () => T): T {
+	return capabilityALS.run(ctx, fn);
 }
 
 // =============================================================================

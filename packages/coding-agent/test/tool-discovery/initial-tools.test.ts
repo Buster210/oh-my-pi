@@ -11,8 +11,8 @@ import {
 	GithubTool,
 	IrcTool,
 	JobTool,
-	SshTool,
 } from "@oh-my-pi/pi-coding-agent/tools";
+import { SshTool } from "@oh-my-pi/pi-coding-agent/tools/ssh";
 
 const allToolsSettings = Settings.isolated({
 	"astGrep.enabled": true,

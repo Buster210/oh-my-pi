@@ -29,6 +29,7 @@ import { JSONC, YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
+import { getSessionScope } from "../modes/daemon/session-scope";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
 import { normalizeToolName } from "../tools/builtin-names";
@@ -240,16 +241,20 @@ export class Settings {
 	#project: RawSettings = {};
 	/** Extra config.yml-style overlays passed by CLI */
 	#configOverlay: RawSettings = {};
-	/** Runtime overrides (not persisted) */
+	/** Runtime overrides (not persisted). Standalone fallback when no session scope is active. */
 	#overrides: RawSettings = {};
 	/** Merged view (global + project + overrides) */
 	#merged: RawSettings = {};
+	/** The overrides object `#merged` was last built from — used to detect a session-scope switch. */
+	#mergedFromOverrides: RawSettings = this.#overrides;
 	/** Cached resolved values from the merged view, including defaults/path scoping */
 	#resolvedCache = new Map<SettingPath, unknown>();
 	#editVariantCache: readonly EditVariantEntry[] | undefined;
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
+	/** Values queued for persistence by session-scoped `set()` calls. */
+	#pendingPersist = new Map<string, unknown>();
 
 	/** Legacy `lastChangelogVersion` captured from config.yml during migration (now a marker file). */
 	#legacyLastChangelogVersion?: string;
@@ -355,6 +360,7 @@ export class Settings {
 	 * Returns the merged value from global + project + overrides, or the default.
 	 */
 	get<P extends SettingPath>(path: P): SettingValue<P> {
+		this.#ensureMergedForActiveScope();
 		if (this.#resolvedCache.has(path)) {
 			return this.#resolvedCache.get(path) as SettingValue<P>;
 		}
@@ -371,7 +377,55 @@ export class Settings {
 	 * config, or runtime override) rather than falling back to the schema default.
 	 */
 	isConfigured(path: SettingPath): boolean {
+		this.#ensureMergedForActiveScope();
 		return getByPath(this.#merged, SETTING_PATH_SEGMENTS[path]) !== undefined;
+	}
+
+	/**
+	 * The runtime-overrides layer for the currently active async context: the
+	 * calling session's scoped overlay when a `SessionScope` is active, else
+	 * the standalone `#overrides` map. Outside any scope this always resolves
+	 * to the same object, so behaviour is unchanged from before session
+	 * scoping existed.
+	 */
+	#overridesFor(): RawSettings {
+		return getSessionScope()?.settingsOverrides.get(this) ?? this.#overrides;
+	}
+
+	/**
+	 * Like {@link #overridesFor} but for writers: the first override written
+	 * inside a given session scope allocates that scope's private overlay
+	 * (seeded from a fresh copy of the standalone overrides at scope-entry
+	 * time) and stores it in the scope's `settingsOverrides` WeakMap, so a
+	 * later `#overridesFor()` read — from this scope or any other — sees an
+	 * object private to this scope instead of silently falling through to
+	 * (and mutating) the shared standalone `#overrides`.
+	 */
+	#mutableOverridesFor(): RawSettings {
+		const scope = getSessionScope();
+		if (!scope) return this.#overrides;
+		let overlay = scope.settingsOverrides.get(this);
+		if (!overlay) {
+			overlay = structuredClone(this.#overrides);
+			scope.settingsOverrides.set(this, overlay);
+		}
+		return overlay;
+	}
+
+	/**
+	 * `#merged`/`#resolvedCache` are built from a specific overrides object.
+	 * When the active async context's overrides layer differs from the one
+	 * `#merged` was last built from (a session switch, or the first read
+	 * inside a freshly entered scope), rebuild before reading. A cheap
+	 * identity check, so the standalone path — where `#overridesFor()` always
+	 * returns the same `#overrides` object — never rebuilds beyond what
+	 * `set`/`override`/`clearOverride` already trigger.
+	 */
+	#ensureMergedForActiveScope(): void {
+		const active = this.#overridesFor();
+		if (active !== this.#mergedFromOverrides) {
+			this.#rebuildMerged();
+		}
 	}
 
 	/**
@@ -382,7 +436,18 @@ export class Settings {
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		const prev = this.get(path);
 		const segments = path.split(".");
-		setByPath(this.#global, segments, value);
+		const scope = getSessionScope();
+		if (scope) {
+			// Inside a daemon session: apply to this session's override
+			// layer so other live sessions are unaffected, while queuing
+			// the value for disk persistence separately from #global.
+			setByPath(this.#mutableOverridesFor(), segments, value);
+			this.#pendingPersist.set(path, value);
+		} else {
+			// Standalone / outside session scope: mutate #global as before.
+			setByPath(this.#global, segments, value);
+			this.#pendingPersist.delete(path);
+		}
 		this.#modified.add(path);
 		this.#rebuildMerged();
 		const next = this.get(path);
@@ -402,7 +467,7 @@ export class Settings {
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		const prev = this.get(path);
 		const segments = path.split(".");
-		setByPath(this.#overrides, segments, value);
+		setByPath(this.#mutableOverridesFor(), segments, value);
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged(path, this.get(path), prev);
 	}
@@ -413,7 +478,7 @@ export class Settings {
 	clearOverride(path: SettingPath): void {
 		const prev = this.get(path);
 		const segments = path.split(".");
-		let current = this.#overrides;
+		let current = this.#mutableOverridesFor();
 		for (let i = 0; i < segments.length - 1; i++) {
 			const segment = segments[i];
 			if (!(segment in current)) return;
@@ -606,7 +671,7 @@ export class Settings {
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
 		const current = this.#modelRolesFromLayer(this.#global);
-		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
+		const runtimeOverrides = getByPath(this.#overridesFor(), ["modelRoles"]);
 		const updateRuntimeOverride =
 			!!runtimeOverrides &&
 			typeof runtimeOverrides === "object" &&
@@ -617,7 +682,7 @@ export class Settings {
 		this.set("modelRoles", current);
 
 		if (updateRuntimeOverride) {
-			const nextRuntimeOverride = this.#modelRolesFromLayer(this.#overrides);
+			const nextRuntimeOverride = this.#modelRolesFromLayer(this.#overridesFor());
 			nextRuntimeOverride[role] = modelId;
 			this.override("modelRoles", nextRuntimeOverride);
 		}
@@ -654,7 +719,7 @@ export class Settings {
 	 * Override model roles (helper for modelRoles record).
 	 */
 	overrideModelRoles(roles: ReadOnlyDict<string>): void {
-		const next = this.#modelRolesFromLayer(this.#overrides);
+		const next = this.#modelRolesFromLayer(this.#overridesFor());
 		for (const [role, modelId] of Object.entries(roles)) {
 			if (modelId) {
 				next[role] = modelId;
@@ -1305,25 +1370,59 @@ export class Settings {
 		const modifiedPaths = [...this.#modified];
 		this.#modified.clear();
 
+		// Snapshot the session-scoped values being persisted this round; a
+		// scoped set() racing the disk write below must not be lost or clobbered.
+		const scopedValues = new Map<string, unknown>();
+		for (const modPath of modifiedPaths) {
+			if (this.#pendingPersist.has(modPath)) {
+				scopedValues.set(modPath, this.#pendingPersist.get(modPath));
+			}
+		}
+
 		try {
 			await withFileLock(configPath, async () => {
 				// Re-read to preserve external changes
 				const current = await this.#loadYaml(configPath);
 
-				// Apply only our modified paths
+				// Fold this process's non-scoped modifications into the fresh
+				// disk state; #global takes this object below.
 				for (const modPath of modifiedPaths) {
+					if (scopedValues.has(modPath)) continue;
 					const segments = modPath.split(".");
-					const value = getByPath(this.#global, segments);
-					setByPath(current, segments, value);
+					setByPath(current, segments, getByPath(this.#global, segments));
 				}
 
-				// Update our global with any external changes we preserved
+				// Session-scoped values go ONLY into the disk payload — never
+				// into the live #global other sessions merge from (the write
+				// below yields the event loop, so any pollution of #global here
+				// is readable by concurrent sessions). New boots pick scoped
+				// values up from disk; live sessions keep their own view.
+				// structuredClone, not #deepMerge({}, x): the latter aliases
+				// nested objects, so setByPath on the "copy" would mutate the
+				// same objects #global holds.
+				let disk = current;
+				if (scopedValues.size > 0) {
+					disk = structuredClone(current);
+					for (const [modPath, value] of scopedValues) {
+						setByPath(disk, modPath.split("."), value);
+					}
+				}
+
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				await Bun.write(configPath, YAML.stringify(disk, null, 2));
 			});
+
+			// Drop persisted scoped values unless a newer set() replaced them
+			// while the write was in flight (that set re-queued a save).
+			for (const [modPath, value] of scopedValues) {
+				if (this.#pendingPersist.get(modPath) === value) {
+					this.#pendingPersist.delete(modPath);
+				}
+			}
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
-			// Re-add failed paths for retry
+			// Re-add failed paths for retry. #pendingPersist is preserved
+			// (not cleared) so scoped values survive into the retry.
 			for (const p of modifiedPaths) {
 				this.#modified.add(p);
 			}
@@ -1337,9 +1436,11 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	#rebuildMerged(): void {
+		const activeOverrides = this.#overridesFor();
 		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#project);
 		this.#merged = this.#deepMerge(this.#merged, this.#configOverlay);
-		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
+		this.#merged = this.#deepMerge(this.#merged, activeOverrides);
+		this.#mergedFromOverrides = activeOverrides;
 		this.#resolvedCache.clear();
 		this.#editVariantCache = undefined;
 	}
@@ -1454,6 +1555,14 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 			appendOnlyModeSignal.fire(value);
 		}
 	},
+	// ponytail: intentionally left process-global, not session-scoped. This limiter
+	// is a cross-process file-lock/lease system (packages/ai/src/stream.ts) that
+	// caps total in-flight requests to a provider across the whole machine, not
+	// per-caller state — a daemon's shared backend has ONE real connection to each
+	// provider, so "total in-flight from this process" is the correct scope. Scoping
+	// it per-session would require threading per-call context deep through pi-ai's
+	// stream/lock plumbing for no behavioral win. Upgrade path: only if pi-ai grows
+	// a cheap per-context override.
 	"providers.maxInFlightRequests": value => {
 		configureProviderMaxInFlightRequests(validateProviderMaxInFlightRequests(value));
 	},

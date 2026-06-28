@@ -9,6 +9,7 @@ import * as os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { Terminal } from "@oh-my-pi/pi-tui";
 import {
 	$env,
 	directoryExists,
@@ -17,6 +18,7 @@ import {
 	logger,
 	normalizePathForComparison,
 	postmortem,
+	runWithNotificationsSuppressed,
 	setProjectDir,
 	VERSION,
 } from "@oh-my-pi/pi-utils";
@@ -92,7 +94,7 @@ type RunRpcMode = (
 	session: AgentSession,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
-) => Promise<never>;
+) => Promise<void>;
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
@@ -392,24 +394,49 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	};
 }
 
-async function runInteractiveMode(
-	session: AgentSession,
-	version: string,
-	changelogMarkdown: string | undefined,
-	notifs: (InteractiveModeNotify | null)[],
-	versionCheckPromise: Promise<string | undefined>,
-	initialMessages: string[],
-	setExtensionUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
-	lspServers: LspStartupServerInfo[] | undefined,
-	mcpManager: MCPManager | undefined,
-	resuming: boolean,
-	forceSetupWizard: boolean,
-	showStartupSplash: boolean,
-	eventBus?: EventBus,
-	initialMessage?: string,
-	initialImages?: ImageContent[],
-	joinLink?: string,
-): Promise<void> {
+export interface RunInteractiveModeOptions {
+	session: AgentSession;
+	version: string;
+	changelogMarkdown?: string;
+	notifs: (InteractiveModeNotify | null)[];
+	versionCheckPromise: Promise<string | undefined>;
+	initialMessages: string[];
+	setExtensionUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	lspServers?: LspStartupServerInfo[];
+	mcpManager?: MCPManager;
+	resuming: boolean;
+	forceSetupWizard: boolean;
+	showStartupSplash: boolean;
+	eventBus?: EventBus;
+	initialMessage?: string;
+	initialImages?: ImageContent[];
+	titleSystemPrompt?: string;
+	joinLink?: string;
+	terminal?: Terminal;
+	onExit?: () => void;
+}
+
+export async function runInteractiveMode({
+	session,
+	version,
+	changelogMarkdown,
+	notifs,
+	versionCheckPromise,
+	initialMessages,
+	setExtensionUIContext,
+	lspServers,
+	mcpManager,
+	resuming,
+	forceSetupWizard,
+	showStartupSplash,
+	eventBus,
+	initialMessage,
+	initialImages,
+	titleSystemPrompt,
+	joinLink,
+	terminal,
+	onExit,
+}: RunInteractiveModeOptions): Promise<void> {
 	const mode = new InteractiveMode(
 		session,
 		version,
@@ -418,6 +445,9 @@ async function runInteractiveMode(
 		lspServers,
 		mcpManager,
 		eventBus,
+		titleSystemPrompt,
+		terminal,
+		onExit,
 	);
 
 	// Cold-launch gate: the full setup wizard (every scene + the overlay and
@@ -430,10 +460,13 @@ async function runInteractiveMode(
 		forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
 			? await import("./modes/setup-wizard")
 			: undefined;
+	// An injected terminal (daemon/socket) has no process.stdin/stdout of its
+	// own — the client on the other end owns the real tty — so treat its mere
+	// presence as "is a TTY" rather than reading the host process's streams.
 	const setupScenes = setupWizard
 		? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, {
 				resuming,
-				isTTY: process.stdin.isTTY && process.stdout.isTTY,
+				isTTY: terminal ? true : Boolean(process.stdin.isTTY && process.stdout.isTTY),
 				setupWizardEnabled: settings.get("startup.setupWizard"),
 				force: forceSetupWizard,
 			})
@@ -1011,8 +1044,10 @@ export async function runRootCommand(
 		process.exit(0);
 	}
 
-	if ((parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") && parsedArgs.fileArgs.length > 0) {
-		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
+	const isRpcOrDaemonMode = parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "daemon";
+
+	if (isRpcOrDaemonMode && parsedArgs.fileArgs.length > 0) {
+		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in protocol modes")}\n`);
 		process.exit(1);
 	}
 
@@ -1050,19 +1085,25 @@ export async function runRootCommand(
 		// setup-time checks (e.g. #wrapToolForAcpPermission) also see the yolo intent.
 		settingsInstance.override("tools.approvalMode", "yolo");
 	}
-	if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
+	if (isRpcOrDaemonMode) {
 		applyRpcDefaultSettingOverrides(settingsInstance);
 	} else if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
 	}
-	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
+	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "daemon") {
 		Bun.env.PI_NO_PTY = "1";
 	}
-	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
+	if (
+		parsedArgs.noTitle ||
+		parsedArgs.mode === "rpc" ||
+		parsedArgs.mode === "rpc-ui" ||
+		parsedArgs.mode === "acp" ||
+		parsedArgs.mode === "daemon"
+	) {
 		Bun.env.PI_NO_TITLE = "1";
 	}
 	const mode = parsedArgs.mode || "text";
-	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp" || mode === "daemon";
 	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
 	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
@@ -1300,6 +1341,12 @@ export async function runRootCommand(
 		const runAcpMode = deps.runAcpMode ?? (await import("./modes/acp/acp-mode")).runAcpMode;
 		stopStartupWatchdog();
 		await runAcpMode(createAcpSession);
+	} else if (mode === "daemon") {
+		// Long-lived UDS host: heavy module graph + catalog load once here; each
+		// client connection gets its own session over the existing rpc protocol.
+		const { runDaemonHost } = await import("./modes/daemon/daemon-host");
+		stopStartupWatchdog();
+		await runDaemonHost({ sessionOptions, createSession });
 	} else {
 		// Resolve extension-registered CLI flags before creating the session so a
 		// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb
@@ -1406,7 +1453,13 @@ export async function runRootCommand(
 			// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
 			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 			stopStartupWatchdog();
-			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus);
+			// Suppress terminal notifications for this session's call tree: they write
+			// \x07 (BEL)/OSC sequences to stdout, which corrupts the RPC JSON channel.
+			// Per-session (AsyncLocalStorage) instead of mutating process.env, which
+			// would leak across concurrent sessions in a shared-host daemon.
+			await runWithNotificationsSuppressed(() =>
+				runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus),
+			);
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
@@ -1431,24 +1484,25 @@ export async function runRootCommand(
 
 			stopStartupWatchdog();
 			logger.endTiming();
-			await runInteractiveMode(
+			await runInteractiveMode({
 				session,
-				VERSION,
+				version: VERSION,
 				changelogMarkdown,
 				notifs,
 				versionCheckPromise,
-				initialArgs.messages,
-				setToolUIContext,
+				initialMessages: initialArgs.messages,
+				setExtensionUIContext: setToolUIContext,
 				lspServers,
 				mcpManager,
-				Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
-				deps.forceSetupWizard === true,
+				resuming: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork),
+				forceSetupWizard: deps.forceSetupWizard === true,
 				showStartupSplash,
 				eventBus,
 				initialMessage,
 				initialImages,
-				parsedArgs.join,
-			);
+				titleSystemPrompt: sessionOptions.titleSystemPrompt,
+				joinLink: parsedArgs.join,
+			});
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 			stopStartupWatchdog();

@@ -1,5 +1,13 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
+import { logger, workerHostEntry } from "@oh-my-pi/pi-utils";
 import { formatBytes, replaceTabs, truncateToWidth } from "./render-utils";
+import {
+	SQLITE_READER_WORKER_ARG,
+	type SqliteWorkerCallOptions,
+	type SqliteWorkerRequest,
+	type SqliteWorkerRequestBase,
+	type SqliteWorkerResponse,
+} from "./sqlite-reader-protocol";
 import { ToolError } from "./tool-errors";
 
 const SQLITE_MAGIC = new Uint8Array([
@@ -619,7 +627,7 @@ function probeRowCount(db: Database, table: string, cap: number): TableRowCount 
 	return counted > cap ? { kind: "atLeast", rows: cap } : { kind: "exact", rows: counted };
 }
 
-export function listTables(db: Database, options: { probeCap?: number } = {}): SqliteTableSummary[] {
+export function listTablesSync(db: Database, options: { probeCap?: number } = {}): SqliteTableSummary[] {
 	const cap = options.probeCap ?? ROW_COUNT_PROBE_CAP;
 	const names = db
 		.prepare<Pick<SqliteMasterRow, "name">, []>(
@@ -639,7 +647,7 @@ export function listTables(db: Database, options: { probeCap?: number } = {}): S
 	});
 }
 
-export function getTableSchema(db: Database, table: string): string {
+export function getTableSchemaSync(db: Database, table: string): string {
 	const row = getTableMasterRow(db, table);
 	if (!row.sql) {
 		throw new ToolError(`SQLite schema for table '${table}' is unavailable`);
@@ -647,7 +655,7 @@ export function getTableSchema(db: Database, table: string): string {
 	return row.sql;
 }
 
-export function getTablePrimaryKey(db: Database, table: string): { column: string; type: string } | null {
+export function getTablePrimaryKeySync(db: Database, table: string): { column: string; type: string } | null {
 	const primaryKeyColumns = getPrimaryKeyColumns(db, table);
 	if (primaryKeyColumns.length !== 1) {
 		return null;
@@ -657,7 +665,7 @@ export function getTablePrimaryKey(db: Database, table: string): { column: strin
 	return { column: column.name, type: column.type };
 }
 
-export function resolveTableRowLookup(db: Database, table: string): SqliteRowLookup {
+export function resolveTableRowLookupSync(db: Database, table: string): SqliteRowLookup {
 	const primaryKeyColumns = getPrimaryKeyColumns(db, table);
 	if (primaryKeyColumns.length === 1) {
 		const column = primaryKeyColumns[0]!;
@@ -667,7 +675,7 @@ export function resolveTableRowLookup(db: Database, table: string): SqliteRowLoo
 		throw new ToolError(`SQLite table '${table}' has a composite primary key; use '?where=' instead`);
 	}
 
-	const schema = getTableSchema(db, table);
+	const schema = getTableSchemaSync(db, table);
 	if (/\bWITHOUT\s+ROWID\b/i.test(schema)) {
 		throw new ToolError(`SQLite table '${table}' does not expose ROWID; use '?where=' instead`);
 	}
@@ -675,7 +683,7 @@ export function resolveTableRowLookup(db: Database, table: string): SqliteRowLoo
 	return { kind: "rowid" };
 }
 
-export function queryRows(
+export function queryRowsSync(
 	db: Database,
 	table: string,
 	opts: { limit: number; offset: number; order?: string; where?: string },
@@ -697,7 +705,7 @@ export function queryRows(
 	return { columns, rows, totalCount };
 }
 
-export function getRowByKey(
+export function getRowByKeySync(
 	db: Database,
 	table: string,
 	pk: { column: string; type?: string },
@@ -709,7 +717,7 @@ export function getRowByKey(
 	return db.prepare<SqliteRow, SQLQueryBindings[]>(sql).get(binding);
 }
 
-export function getRowByRowId(db: Database, table: string, key: string): Record<string, unknown> | null {
+export function getRowByRowIdSync(db: Database, table: string, key: string): Record<string, unknown> | null {
 	getTableMasterRow(db, table);
 	const binding = coerceIntegerKey(key, "SQLite ROWID");
 	return db
@@ -717,7 +725,7 @@ export function getRowByRowId(db: Database, table: string, key: string): Record<
 		.get(binding);
 }
 
-export function executeReadQuery(
+export function executeReadQuerySync(
 	db: Database,
 	sql: string,
 ): { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean } {
@@ -738,7 +746,7 @@ export function executeReadQuery(
 	return { columns, rows, truncated };
 }
 
-export function insertRow(db: Database, table: string, data: Record<string, unknown>): void {
+export function insertRowSync(db: Database, table: string, data: Record<string, unknown>): void {
 	getTableMasterRow(db, table);
 	const entries = validateWriteColumns(db, table, data);
 	if (entries.length === 0) {
@@ -755,7 +763,7 @@ export function insertRow(db: Database, table: string, data: Record<string, unkn
 	statement.run(...bindings);
 }
 
-export function updateRowByKey(
+export function updateRowByKeySync(
 	db: Database,
 	table: string,
 	pk: { column: string; type?: string },
@@ -777,7 +785,7 @@ export function updateRowByKey(
 	return statement.run(...bindings).changes;
 }
 
-export function updateRowByRowId(db: Database, table: string, key: string, data: Record<string, unknown>): number {
+export function updateRowByRowIdSync(db: Database, table: string, key: string, data: Record<string, unknown>): number {
 	getTableMasterRow(db, table);
 	const entries = validateWriteColumns(db, table, data);
 	if (entries.length === 0) {
@@ -793,7 +801,7 @@ export function updateRowByRowId(db: Database, table: string, key: string, data:
 	return statement.run(...bindings).changes;
 }
 
-export function deleteRowByKey(
+export function deleteRowByKeySync(
 	db: Database,
 	table: string,
 	pk: { column: string; type?: string },
@@ -807,13 +815,355 @@ export function deleteRowByKey(
 	return statement.run(binding).changes;
 }
 
-export function deleteRowByRowId(db: Database, table: string, key: string): number {
+export function deleteRowByRowIdSync(db: Database, table: string, key: string): number {
 	getTableMasterRow(db, table);
 	const binding = coerceIntegerKey(key, "SQLite ROWID");
 	const statement = db.prepare<SqliteRow, SQLQueryBindings[]>(
 		`DELETE FROM ${quoteSqliteIdentifier(table)} WHERE rowid = ?`,
 	);
 	return statement.run(binding).changes;
+}
+
+interface SqliteWorkerSlot {
+	worker: Worker;
+	busy: boolean;
+	current: SqlitePendingRequest<unknown> | null;
+}
+
+interface SqlitePendingRequest<T> {
+	request: SqliteWorkerRequest;
+	resolve: (value: T) => void;
+	reject: (error: Error) => void;
+	timeout: NodeJS.Timeout | null;
+	state: "queued" | "running" | "done";
+	slot: SqliteWorkerSlot | null;
+}
+
+const SQLITE_WORKER_POOL_MAX = 2;
+const SQLITE_WORKER_TIMEOUT_MS = 12_000;
+const sqliteWorkerPool: SqliteWorkerSlot[] = [];
+const sqliteWorkerQueue: SqlitePendingRequest<unknown>[] = [];
+let nextSqliteRequestId = 0;
+
+function createSqliteWorker(): Worker {
+	const hostEntry = workerHostEntry();
+	if (hostEntry) {
+		return new Worker(hostEntry, { type: "module", argv: [SQLITE_READER_WORKER_ARG] });
+	}
+	return new Worker(new URL("./sqlite-reader-worker.ts", import.meta.url).href, { type: "module" });
+}
+
+function spawnSqliteWorkerSlot(): SqliteWorkerSlot {
+	const worker = createSqliteWorker();
+	worker.unref();
+	const slot: SqliteWorkerSlot = { worker, busy: false, current: null };
+	worker.onmessage = event => handleSqliteWorkerMessage(slot, event.data as SqliteWorkerResponse);
+	worker.onerror = event => handleSqliteWorkerError(slot, event);
+	return slot;
+}
+
+function handleSqliteWorkerMessage(slot: SqliteWorkerSlot, message: SqliteWorkerResponse): void {
+	const pending = slot.current;
+	if (!pending || pending.request.id !== message.id || pending.state !== "running") {
+		return;
+	}
+
+	slot.current = null;
+	slot.busy = false;
+	if (pending.timeout) clearTimeout(pending.timeout);
+	pending.timeout = null;
+	pending.state = "done";
+	if (message.type === "error") {
+		const error = new ToolError(message.error);
+		// Preserve the errno code across the thread boundary so callers'
+		// isEnoent()-style checks keep working (e.g. write.ts's friendly
+		// "database not found" message for a file deleted mid-flight).
+		if (message.code) (error as Error & { code?: string }).code = message.code;
+		pending.reject(error);
+	} else {
+		pending.resolve(message.result as never);
+	}
+	slot.worker.unref();
+	pumpSqliteWorkerQueue();
+}
+
+function handleSqliteWorkerError(slot: SqliteWorkerSlot, event: ErrorEvent): void {
+	const message = event.error instanceof Error ? event.error.message : event.message || "sqlite reader worker error";
+	logger.warn("sqlite reader worker error", { error: message });
+	const pending = slot.current;
+	slot.current = null;
+	slot.busy = false;
+	if (pending && pending.state === "running") {
+		if (pending.timeout) clearTimeout(pending.timeout);
+		pending.timeout = null;
+		pending.state = "done";
+		pending.reject(new ToolError(message));
+	}
+	dropSqliteWorkerSlot(slot);
+	void slot.worker.terminate();
+	pumpSqliteWorkerQueue();
+}
+
+function dropSqliteWorkerSlot(slot: SqliteWorkerSlot): void {
+	const index = sqliteWorkerPool.indexOf(slot);
+	if (index !== -1) sqliteWorkerPool.splice(index, 1);
+}
+
+function failQueuedSqliteRequests(error: Error): void {
+	while (sqliteWorkerQueue.length > 0) {
+		const pending = sqliteWorkerQueue.shift();
+		if (!pending) break;
+		if (pending.timeout) clearTimeout(pending.timeout);
+		pending.timeout = null;
+		pending.state = "done";
+		pending.reject(error);
+	}
+}
+
+function dispatchSqlitePending(slot: SqliteWorkerSlot, pending: SqlitePendingRequest<unknown>): void {
+	slot.busy = true;
+	slot.current = pending;
+	pending.slot = slot;
+	pending.state = "running";
+	slot.worker.ref();
+	slot.worker.postMessage(pending.request);
+}
+
+function pumpSqliteWorkerQueue(): void {
+	while (sqliteWorkerQueue.length > 0) {
+		const slot = sqliteWorkerPool.find(candidate => !candidate.busy);
+		let workerSlot = slot;
+		if (!workerSlot && sqliteWorkerPool.length < SQLITE_WORKER_POOL_MAX) {
+			try {
+				workerSlot = spawnSqliteWorkerSlot();
+			} catch (error) {
+				failQueuedSqliteRequests(error instanceof Error ? error : new ToolError(String(error)));
+				return;
+			}
+		}
+		if (!workerSlot) {
+			return;
+		}
+		if (!sqliteWorkerPool.includes(workerSlot)) {
+			sqliteWorkerPool.push(workerSlot);
+		}
+
+		const pending = sqliteWorkerQueue.shift();
+		if (!pending) {
+			return;
+		}
+		try {
+			dispatchSqlitePending(workerSlot, pending);
+		} catch (error) {
+			// Fail only the request that couldn't be dispatched (e.g. a
+			// postMessage clone error is specific to its payload) and sacrifice
+			// the slot; keep pumping so queued requests get a fresh worker.
+			pending.state = "done";
+			pending.timeout = null;
+			pending.reject(error instanceof Error ? error : new ToolError(String(error)));
+			dropSqliteWorkerSlot(workerSlot);
+			void workerSlot.worker.terminate();
+		}
+	}
+}
+
+function queueSqliteWorkerRequest<T>(request: SqliteWorkerRequestBase, timeoutMs: number): Promise<T> {
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
+	const timerMs = Math.max(1, Math.floor(timeoutMs));
+	const pending: SqlitePendingRequest<T> = {
+		request: { ...request, id: String(++nextSqliteRequestId) },
+		resolve,
+		reject,
+		timeout: null,
+		state: "queued",
+		slot: null,
+	};
+	pending.timeout = setTimeout(() => {
+		if (pending.state === "done") {
+			return;
+		}
+
+		const timeoutError = new ToolError(`SQLite worker timed out after ${timerMs}ms`);
+		if (pending.state === "queued") {
+			const index = sqliteWorkerQueue.indexOf(pending as SqlitePendingRequest<unknown>);
+			if (index !== -1) sqliteWorkerQueue.splice(index, 1);
+			pending.state = "done";
+			pending.timeout = null;
+			pending.reject(timeoutError);
+			pumpSqliteWorkerQueue();
+			return;
+		}
+
+		const slot = pending.slot;
+		pending.state = "done";
+		pending.timeout = null;
+		if (!slot) {
+			pending.reject(timeoutError);
+			return;
+		}
+
+		slot.current = null;
+		slot.busy = false;
+		dropSqliteWorkerSlot(slot);
+		pending.reject(timeoutError);
+		logger.warn("sqlite reader worker timed out; recycling worker", {
+			timeoutMs: timerMs,
+			requestType: pending.request.type,
+		});
+		void slot.worker.terminate();
+		pumpSqliteWorkerQueue();
+	}, timerMs);
+	sqliteWorkerQueue.push(pending as SqlitePendingRequest<unknown>);
+	pumpSqliteWorkerQueue();
+	return promise;
+}
+
+function normalizeSqliteTimeout(options?: SqliteWorkerCallOptions): number {
+	return options?.timeoutMs ?? SQLITE_WORKER_TIMEOUT_MS;
+}
+
+export async function listTables(
+	sqlitePath: string,
+	options: { probeCap?: number } & SqliteWorkerCallOptions = {},
+): Promise<SqliteTableSummary[]> {
+	return await queueSqliteWorkerRequest<SqliteTableSummary[]>(
+		{ type: "listTables", path: sqlitePath, probeCap: options.probeCap },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function getTableSchema(
+	sqlitePath: string,
+	table: string,
+	options?: SqliteWorkerCallOptions,
+): Promise<string> {
+	return await queueSqliteWorkerRequest<string>(
+		{ type: "getTableSchema", path: sqlitePath, table },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function resolveTableRowLookup(
+	sqlitePath: string,
+	table: string,
+	options?: SqliteWorkerCallOptions,
+): Promise<SqliteRowLookup> {
+	return await queueSqliteWorkerRequest<SqliteRowLookup>(
+		{ type: "resolveTableRowLookup", path: sqlitePath, table },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function queryRows(
+	sqlitePath: string,
+	table: string,
+	opts: { limit: number; offset: number; order?: string; where?: string },
+	options?: SqliteWorkerCallOptions,
+): Promise<{ columns: string[]; rows: Record<string, unknown>[]; totalCount: number }> {
+	return await queueSqliteWorkerRequest<{ columns: string[]; rows: Record<string, unknown>[]; totalCount: number }>(
+		{ type: "queryRows", path: sqlitePath, table, opts },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function getRowByKey(
+	sqlitePath: string,
+	table: string,
+	pk: { column: string; type?: string },
+	key: string,
+	options?: SqliteWorkerCallOptions,
+): Promise<Record<string, unknown> | null> {
+	return await queueSqliteWorkerRequest<Record<string, unknown> | null>(
+		{ type: "getRowByKey", path: sqlitePath, table, lookup: pk, key },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function getRowByRowId(
+	sqlitePath: string,
+	table: string,
+	key: string,
+	options?: SqliteWorkerCallOptions,
+): Promise<Record<string, unknown> | null> {
+	return await queueSqliteWorkerRequest<Record<string, unknown> | null>(
+		{ type: "getRowByRowId", path: sqlitePath, table, key },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function executeReadQuery(
+	sqlitePath: string,
+	sql: string,
+	options?: SqliteWorkerCallOptions,
+): Promise<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }> {
+	return await queueSqliteWorkerRequest<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>(
+		{ type: "executeReadQuery", path: sqlitePath, sql },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function insertRow(
+	sqlitePath: string,
+	table: string,
+	data: Record<string, unknown>,
+	options?: SqliteWorkerCallOptions,
+): Promise<void> {
+	await queueSqliteWorkerRequest<void>(
+		{ type: "insertRow", path: sqlitePath, table, data },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function updateRowByKey(
+	sqlitePath: string,
+	table: string,
+	pk: { column: string; type?: string },
+	key: string,
+	data: Record<string, unknown>,
+	options?: SqliteWorkerCallOptions,
+): Promise<number> {
+	return await queueSqliteWorkerRequest<number>(
+		{ type: "updateRowByKey", path: sqlitePath, table, lookup: pk, key, data },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function updateRowByRowId(
+	sqlitePath: string,
+	table: string,
+	key: string,
+	data: Record<string, unknown>,
+	options?: SqliteWorkerCallOptions,
+): Promise<number> {
+	return await queueSqliteWorkerRequest<number>(
+		{ type: "updateRowByRowId", path: sqlitePath, table, key, data },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function deleteRowByKey(
+	sqlitePath: string,
+	table: string,
+	pk: { column: string; type?: string },
+	key: string,
+	options?: SqliteWorkerCallOptions,
+): Promise<number> {
+	return await queueSqliteWorkerRequest<number>(
+		{ type: "deleteRowByKey", path: sqlitePath, table, lookup: pk, key },
+		normalizeSqliteTimeout(options),
+	);
+}
+
+export async function deleteRowByRowId(
+	sqlitePath: string,
+	table: string,
+	key: string,
+	options?: SqliteWorkerCallOptions,
+): Promise<number> {
+	return await queueSqliteWorkerRequest<number>(
+		{ type: "deleteRowByRowId", path: sqlitePath, table, key },
+		normalizeSqliteTimeout(options),
+	);
 }
 
 function formatRowCount(count: TableRowCount): string {
