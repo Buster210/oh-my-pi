@@ -1,0 +1,33 @@
+#!/bin/sh
+# ompp-anywhere - Use OMP from any directory with isolated config
+# This script provides "ompp anywhere" functionality
+set -e
+
+# Resolve the installed package location
+OMPP_HOME="${HOME}/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent"
+if [ ! -f "$OMPP_HOME/dist/cli.js" ]; then
+    echo "ompp-anywhere: pi-coding-agent not found. Install with:"
+    echo "  bun install -g @oh-my-pi/pi-coding-agent"
+    exit 1
+fi
+
+# Use a separate config directory for isolation (.ompp)
+export PI_CONFIG_DIR="${HOME}/.ompp-anywhere"
+
+# Set OMP_LAUNCH_CWD to preserve the current directory
+OMP_LAUNCH_CWD="${PWD:-$(pwd)}"
+export OMP_LAUNCH_CWD
+
+# Find the preload script (needed for cwd restoration)
+PRELOAD="${OMPP_HOME}/scripts/omp.ts"
+if [ ! -f "$PRELOAD" ]; then
+    # Fallback for when preload isn't packaged
+    PRELOAD=""
+fi
+
+# Execute omp from the installed location
+if [ -n "$PRELOAD" ] && [ -f "$PRELOAD" ]; then
+    exec bun --preload "$PRELOAD" "$OMPP_HOME/dist/cli.js" "$@"
+else
+    exec bun "$OMPP_HOME/dist/cli.js" "$@"
+fi

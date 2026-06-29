@@ -1,0 +1,41 @@
+#!/bin/sh
+# ompp - Local development wrapper using the built dist/cli.js
+# Use PI_CONFIG_DIR=.ompp for complete isolation from main omp
+set -e
+
+# Resolve this script's real location
+self=$0
+while [ -L "$self" ]; do
+	link=$(readlink "$self")
+	case $link in
+		/*) self=$link ;;
+		*) self=$(dirname "$self")/$link ;;
+	esac
+done
+bench_dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+pkg_dir=$bench_dir/../packages/coding-agent
+cli=$pkg_dir/dist/cli.js
+
+# Use separate config directory for isolation
+export PI_CONFIG_DIR=".ompp"
+
+# Set OMP_LAUNCH_CWD to preserve the current directory
+OMP_LAUNCH_CWD="${PWD:-$(pwd)}"
+export OMP_LAUNCH_CWD
+
+# For native modules, use local natives build
+OMP_HOME="${HOME}/.ompp"
+export NODE_PATH="$OMPP_HOME:$OMPP_HOME/natives:$OMPP_HOME/pi-natives:$OMPP_HOME/pi-ai:$OMPP_HOME/pi-utils:$OMPP_HOME/pi-coding-agent/node_modules"
+
+launch_dir=${OMP_DEV_LAUNCH_DIR:-${HOME}/.ompp/.dev-cwd}
+mkdir -p "$launch_dir"
+
+cd "$launch_dir"
+
+# Check if dist/cli.js exists
+if [ ! -f "$cli" ]; then
+    echo "ompp: dist/cli.js not found. Run 'bun run gen:bundle' first."
+    exit 1
+fi
+
+exec bun --preload "$pkg_dir/scripts/omp.ts" "$cli" "$@"

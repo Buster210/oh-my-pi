@@ -1,0 +1,83 @@
+#!/bin/sh
+# ompp boots the minified bundle (dist/cli.js) under the shared omp identity and
+# daemon socket. `ompp` and `omp` share state — this is a convenience alias, not an
+# isolated app. Mirrors scripts/omp's bunfig-preload cwd fix.
+set -e
+
+self=$0
+while [ -L "$self" ]; do
+	link=$(readlink "$self")
+	case $link in
+	/*) self=$link ;;
+	*) self=$(dirname "$self")/$link ;;
+	esac
+done
+bench_dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+# Absolutize self: it re-execs itself (line ~55) AFTER cd'ing to launch_dir, so a
+# relative $0 like ./bench/ompp would no longer resolve. bench_dir is absolute.
+self=$bench_dir/$(basename -- "$self")
+pkg_dir=$bench_dir/../packages/coding-agent
+cli=$pkg_dir/dist/cli.js
+preload=$pkg_dir/scripts/omp.ts
+
+export OMP_APP_NAME="omp"
+
+launch_dir=${OMP_DEV_LAUNCH_DIR:-${HOME}/.omp/.dev-cwd}
+mkdir -p "$launch_dir"
+
+OMP_LAUNCH_CWD=$PWD
+export OMP_LAUNCH_CWD
+cd "$launch_dir"
+
+SOCK="/tmp/omp-daemon/${OMP_APP_NAME}-$(id -u).sock"
+daemon_alive() {
+	[ -S "$SOCK" ] && node -e 'require("net").connect(process.argv[1]).on("connect",()=>process.exit(0)).on("error",()=>process.exit(1))' "$SOCK" 2>/dev/null
+}
+
+case " $* " in
+*" --mode daemon "* | *" --mode=daemon "*)
+	exec bun --preload "$preload" "$cli" "$@"
+	;;
+esac
+
+# First launch starts the daemon (~410MB module graph); subsequent launches reuse it
+# as a ~13MB thin client. mkdir is an atomic lock — simultaneous first-launches
+# race for the socket; a dead holder's lock is stale and stolen (see lock_stale).
+lock_stale() {
+	if [ -f "${SOCK}.lock/pid" ]; then
+		pid=$(cat "${SOCK}.lock/pid" 2>/dev/null)
+		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 1
+		return 0
+	fi
+	[ -n "$(find "${SOCK}.lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]
+}
+acquire_lock() {
+	# pid write is best-effort (mirrors tui-client.cjs writeLockPid): mkdir alone
+	# holds the lock; a failed write just degrades staleness to the age check.
+	if mkdir "${SOCK}.lock" 2>/dev/null; then
+		echo $$ >"${SOCK}.lock/pid" 2>/dev/null || true
+		return 0
+	fi
+	lock_stale || return 1
+	rm -rf "${SOCK}.lock"
+	mkdir "${SOCK}.lock" 2>/dev/null || return 1
+	echo $$ >"${SOCK}.lock/pid" 2>/dev/null || true
+}
+if [ "$#" -eq 0 ]; then
+	if ! daemon_alive; then
+		mkdir -p "$(dirname "$SOCK")"
+		if acquire_lock; then
+			# detached:true gives the daemon its own pgrp — without it, closing the
+			# launching terminal would signal the daemon and kill every client.
+			OMP_DAEMON_TUI=1 node -e 'const fs=require("fs");const log=fs.openSync("/tmp/omp-daemon.log","w");require("child_process").spawn("bash",[process.argv[1],"--mode","daemon"],{stdio:["ignore",log,log],detached:true}).unref()' "$self"
+			for _ in $(seq 1 80); do daemon_alive && break; sleep 0.5; done
+			rm -rf "${SOCK}.lock"
+		else
+			for _ in $(seq 1 120); do daemon_alive && break; sleep 0.5; done
+		fi
+		daemon_alive || { echo "ompp: daemon failed to start; see /tmp/omp-daemon.log" >&2; exit 1; }
+	fi
+	exec node "$bench_dir/tui-client.cjs" "$SOCK"
+fi
+
+exec bun --preload "$preload" "$cli" "$@"
