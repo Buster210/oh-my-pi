@@ -2,6 +2,21 @@
 
 Measures the **real** per-process private working set of parallel OMP sessions.
 
+## Quick Reference
+
+| Mode | Command | Notes |
+|------|---------|-------|
+| Default (shared) | `./ompp` | Auto-starts daemon, shared `~/.omp` config |
+| Isolated | `./ompp --isolated` | `.ompp` config, no daemon |
+| Source | `./ompp --isolated --source` | Source TS, no daemon |
+| Lazy | `./ompp --isolated --lazy` | Source + MCP lazy-connect |
+| Anywhere | `./ompp --anywhere` | Global install, `~/.ompp-anywhere` config |
+| Direct CLI | `./ompp --mode cli` | No daemon, direct bun execution |
+| Daemon | `./ompp --mode daemon` | Start daemon explicitly |
+| Client | `./ompp --mode client` | Thin client only (fail if daemon down) |
+
+Run `./ompp --help` for full flag reference.
+
 ## Why phys_footprint, not RSS
 
 The 127 MB `pi_natives` addon is a Mach-O shared library (`__TEXT` 130 MB,
@@ -16,8 +31,13 @@ number — the one that must drop to prove cross-instance savings.
 
 ```sh
 # builds are expected at packages/coding-agent/dist/cli.js (bun run gen:bundle)
-zsh bench/mem-bench.sh [launcher] [settle_secs] [counts...]
-zsh bench/mem-bench.sh bench/ompp 15 1 3      # default
+zsh bench/mem-bench.sh [launcher] [settle_secs] counts...
+
+# unified ompp (recommended)
+zsh bench/mem-bench.sh bench/ompp 15 1 3
+
+# with flags — pass via quoted launcher path
+zsh bench/mem-bench.sh "bench/ompp --isolated" 15 1 3
 ```
 
 Sessions launch via `key <launcher>` in a non-interactive login zsh under a pty
@@ -34,8 +54,8 @@ parallel measured, then all killed.
 Private memory scales linearly (~390 MB/instance duplicated). Handoff's "521 MB
 baseline" was RSS; the honest private figure is ~384 MB.
 
-## Note
+## Legacy
 
-`bench/ompp` runs the minified bundle and resolves the native addon from the
-global install (repo's committed `.node` fails the version sentinel). It
-isolates config under `PI_CONFIG_DIR=.ompp`.
+`ompp.original.bak` is the pre-consolidation script. Superseded by `ompp`
+which covers all four original modes (shared, isolated, source, anywhere) in
+one script with flag-based dispatch.
