@@ -26,6 +26,7 @@
  * `Terminal` contract enough for `TUI`/`InteractiveMode` to render.
  */
 import type { Socket } from "node:net";
+import { StringDecoder } from "node:string_decoder";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui";
 import type { ClipboardKind } from "./session-scope";
 
@@ -79,6 +80,15 @@ export class SocketTerminal implements Terminal {
 	#cols: number;
 	#rows: number;
 	#buf: Buffer = Buffer.alloc(0);
+	/**
+	 * Decodes FRAME_INPUT payloads. The client frames each raw stdin chunk on its
+	 * own, and the OS splits a large paste at arbitrary BYTE offsets — routinely
+	 * mid-UTF-8. Decoding each frame independently with `toString("utf8")` turns a
+	 * multibyte scalar straddling a frame boundary into U+FFFD on both sides,
+	 * corrupting large/non-ASCII pastes. A persistent decoder carries the partial
+	 * trailing bytes into the next frame instead, exactly like a real TTY's stream.
+	 */
+	#inputDecoder = new StringDecoder("utf8");
 	#inputHandler?: (data: string) => void;
 	#resizeHandler?: () => void;
 	/**
@@ -160,7 +170,8 @@ export class SocketTerminal implements Terminal {
 			const payload = this.#buf.subarray(HEADER_BYTES, HEADER_BYTES + len);
 			this.#buf = this.#buf.subarray(HEADER_BYTES + len);
 			if (type === FRAME_INPUT) {
-				const data = payload.toString("utf8");
+				const data = this.#inputDecoder.write(payload);
+				if (data.length === 0) continue;
 				if (this.#inputHandler) {
 					this.#inputHandler(data);
 				} else {

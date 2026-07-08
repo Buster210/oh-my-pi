@@ -169,6 +169,31 @@ test("split frames reassemble across chunk boundaries", async () => {
 	client.destroy();
 });
 
+test("a multibyte paste split into separate frames at byte boundaries reassembles byte-for-byte", async () => {
+	const { client, terminal } = await setup();
+	const received: string[] = [];
+	terminal.start(
+		d => received.push(d),
+		() => {},
+	);
+
+	// A real large paste: the client frames each raw stdin chunk on its own, and
+	// the OS splits a big paste at arbitrary BYTE offsets — routinely mid-UTF-8.
+	// Each frame is decoded independently in #ingest, so a multibyte scalar
+	// straddling a frame boundary must not corrupt into U+FFFD.
+	const content = `café — 日本語 😀 ${"π".repeat(500)} straße`;
+	const full = Buffer.from(`\x1b[200~${content}\x1b[201~`, "utf8");
+
+	// Slice into many small, odd-sized frames guaranteed to fall mid-codepoint.
+	for (let i = 0; i < full.length; i += 3) {
+		client.write(encodeFrame(FRAME_INPUT, full.subarray(i, i + 3)));
+	}
+	await Bun.sleep(60);
+
+	expect(received.join("")).toBe(`\x1b[200~${content}\x1b[201~`);
+	client.destroy();
+});
+
 // FRAME_CWD/waitForCwd and FRAME_RESUME/waitForResumeSessionId are two
 // independent frame-code -> single-shot-promise pairs with identical
 // round-trip and never-sent shapes.
