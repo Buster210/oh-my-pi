@@ -261,6 +261,7 @@ export async function runDaemonHost(options: DaemonHostOptions): Promise<void> {
 			let sessionContext: (<T>(fn: () => T) => T) | undefined;
 			const terminal = new SocketTerminal(socket, 80, 24, fn => (sessionContext ? sessionContext(fn) : fn()));
 			scope.terminalOut = data => terminal.writeEscape(data);
+			scope.clipboardRequest = (kind, timeoutMs) => terminal.requestClipboard(kind, timeoutMs);
 			void (async () => {
 				// Wait for the client's real cwd (bench/tui-client.cjs sends it right
 				// after connect, before the resize frame) so tool resolution and the

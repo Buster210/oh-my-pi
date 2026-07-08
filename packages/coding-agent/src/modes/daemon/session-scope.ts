@@ -27,6 +27,9 @@ import type { AutoQaConsentHandler } from "../../tools/report-tool-issue";
 import type { SearchProviderId } from "../../web/search/types";
 import type { SymbolPreset, Theme } from "../theme/theme";
 
+/** Kind of clipboard read a daemon session requests from its client. */
+export type ClipboardKind = "image" | "text" | "macFileUrls";
+
 export interface SessionScope {
 	readonly sessionId: string;
 	readonly agentRegistry: AgentRegistry;
@@ -66,6 +69,15 @@ export interface SessionScope {
 	 * `process.stdout` when this is absent, matching standalone behavior.
 	 */
 	terminalOut?: (data: string) => void;
+	/**
+	 * Reads THIS session's client's local OS clipboard over the socket, keeping
+	 * the read client-side so the daemon host's clipboard never leaks across
+	 * sessions. Set only for interactive TUI sessions (wired to the
+	 * `SocketTerminal`); unset for RPC connections and standalone CLI, where
+	 * clipboard reads use the native host path. Resolves `null` on timeout / no
+	 * client, so callers fall back to an empty read.
+	 */
+	clipboardRequest?: (kind: ClipboardKind, timeoutMs: number) => Promise<Buffer | null>;
 	/**
 	 * Mirrors `InternalUrlRouter`'s process-global `#handlers` map, but only for
 	 * schemes dynamically registered at runtime (RPC host URI bridges). Static

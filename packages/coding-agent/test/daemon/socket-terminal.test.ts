@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	encodeFrame,
 	encodeResize,
+	FRAME_CLIPBOARD,
 	FRAME_CWD,
 	FRAME_INPUT,
 	FRAME_RESUME,
@@ -70,6 +71,58 @@ test("input arriving before start() is buffered and flushed in order", async () 
 	await Bun.sleep(30);
 	expect(received.join("")).toBe("hello!");
 	client.destroy();
+});
+
+test("large pre-attach input (past the old 256KB cap) survives intact after start()", async () => {
+	const { client, terminal } = await setup();
+	// Stream more than MAX_PENDING_INPUT_BYTES (256KB) as many frames BEFORE the
+	// handler attaches. The old code silently dropped everything past the cap;
+	// now the socket pauses and TCP holds the tail losslessly.
+	const chunk = "x".repeat(4096);
+	const frameCount = 200; // ~800KB, well past the 256KB cap
+	for (let i = 0; i < frameCount; i++) {
+		client.write(encodeFrame(FRAME_INPUT, Buffer.from(chunk, "utf8")));
+	}
+	await Bun.sleep(80);
+
+	const received: string[] = [];
+	terminal.start(
+		d => received.push(d),
+		() => {},
+	);
+	// Allow the paused kernel-buffered tail to flow in and dispatch live.
+	await Bun.sleep(120);
+	expect(received.join("").length).toBe(chunk.length * frameCount);
+	client.destroy();
+});
+
+test("requestClipboard round-trips the client's reply, keyed by id", async () => {
+	const { client, terminal } = await setup();
+	const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+	// Mock client: on the host's NUL-prefixed JSON control line, reply with a
+	// FRAME_CLIPBOARD frame carrying [4-byte BE id][result bytes].
+	client.on("data", buf => {
+		const s = (buf as Buffer).toString("utf8");
+		const m = s.match(/\x00(\{"omp":"clipboard-read"[^\n]*\})\n/);
+		if (!m) return;
+		const { id, kind } = JSON.parse(m[1]);
+		expect(kind).toBe("image");
+		const idBuf = Buffer.alloc(4);
+		idBuf.writeUInt32BE(id, 0);
+		client.write(encodeFrame(FRAME_CLIPBOARD, Buffer.concat([idBuf, png])));
+	});
+
+	const result = await terminal.requestClipboard("image", 2000);
+	expect(result).not.toBeNull();
+	expect(Buffer.from(result!).equals(png)).toBe(true);
+	client.destroy();
+});
+
+test("requestClipboard resolves null when the client never answers (old client)", async () => {
+	const { terminal } = await setup();
+	// No client handler -> no FRAME_CLIPBOARD reply -> timeout -> null (callers
+	// then return empty, matching pre-daemon behavior; never a hang).
+	expect(await terminal.requestClipboard("text", 40)).toBeNull();
 });
 
 test("resize frames update columns/rows and fire the resize handler", async () => {

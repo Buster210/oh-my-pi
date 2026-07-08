@@ -3,6 +3,9 @@ import * as native from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
 import { getSessionScope } from "../modes/daemon/session-scope";
 
+/** How long a daemon session waits for its client to answer a clipboard-read request. */
+const CLIPBOARD_CLIENT_TIMEOUT_MS = 3000;
+
 /**
  * Run a subprocess and capture its stdout without blocking the event loop.
  *
@@ -93,9 +96,24 @@ const MAC_FILE_URL_SCRIPT = [
  * unavailable, or when the pasteboard holds no file URLs.
  */
 export async function readMacFileUrlsFromClipboard(): Promise<string[]> {
-	// Gate clipboard reads when running under a daemon session with terminalOut
-	// (RPC connections would leak the host OS clipboard into unrelated sessions).
-	if (getSessionScope()?.terminalOut) return [];
+	// Under a daemon TUI session, read the CLIENT's clipboard over the socket
+	// (the host's own OS clipboard must never leak across sessions). Falls back
+	// to an empty list on timeout / old client.
+	const scope = getSessionScope();
+	if (scope?.terminalOut) {
+		if (!scope.clipboardRequest) return [];
+		const buf = await scope.clipboardRequest("macFileUrls", CLIPBOARD_CLIENT_TIMEOUT_MS);
+		if (!buf || buf.length === 0) return [];
+		return buf
+			.toString("utf8")
+			.split(/\r?\n/)
+			.map(line => line.trim())
+			.filter(line => line.length > 0);
+	}
+	return nativeReadMacFileUrls();
+}
+
+async function nativeReadMacFileUrls(): Promise<string[]> {
 	if (process.platform !== "darwin") return [];
 	try {
 		const stdout = await spawnCapture(["osascript", "-"], { input: MAC_FILE_URL_SCRIPT });
@@ -303,9 +321,20 @@ async function readTextViaPowerShell(): Promise<string | null> {
  * @returns PNG payload or null when no image is available.
  */
 export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
-	// Gate clipboard reads when running under a daemon session with terminalOut
-	// (RPC connections would leak the host OS clipboard into unrelated sessions).
-	if (getSessionScope()?.terminalOut) return null;
+	// Under a daemon TUI session, read the CLIENT's clipboard over the socket
+	// (the host's own OS clipboard must never leak across sessions). The client
+	// streams back PNG bytes; falls back to null on timeout / old client.
+	const scope = getSessionScope();
+	if (scope?.terminalOut) {
+		if (!scope.clipboardRequest) return null;
+		const buf = await scope.clipboardRequest("image", CLIPBOARD_CLIENT_TIMEOUT_MS);
+		if (!buf || buf.length === 0) return null;
+		return { data: buf, mimeType: "image/png" };
+	}
+	return nativeReadImage();
+}
+
+async function nativeReadImage(): Promise<ClipboardImage | null> {
 	if (process.env.TERMUX_VERSION) {
 		return null;
 	}
@@ -339,9 +368,19 @@ export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
  * Read plain text from the system clipboard.
  */
 export async function readTextFromClipboard(): Promise<string> {
-	// Gate clipboard reads when running under a daemon session with terminalOut
-	// (RPC connections would leak the host OS clipboard into unrelated sessions).
-	if (getSessionScope()?.terminalOut) return "";
+	// Under a daemon TUI session, read the CLIENT's clipboard over the socket
+	// (the host's own OS clipboard must never leak across sessions). Falls back
+	// to an empty string on timeout / old client.
+	const scope = getSessionScope();
+	if (scope?.terminalOut) {
+		if (!scope.clipboardRequest) return "";
+		const buf = await scope.clipboardRequest("text", CLIPBOARD_CLIENT_TIMEOUT_MS);
+		return buf ? buf.toString("utf8") : "";
+	}
+	return nativeReadText();
+}
+
+async function nativeReadText(): Promise<string> {
 	try {
 		const p = process.platform;
 		if (p === "darwin") {

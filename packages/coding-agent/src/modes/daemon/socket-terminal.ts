@@ -27,16 +27,36 @@
  */
 import type { Socket } from "node:net";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui";
+import type { ClipboardKind } from "./session-scope";
 
 export const FRAME_INPUT = 1;
 export const FRAME_RESIZE = 2;
 export const FRAME_CWD = 3;
 export const FRAME_RESUME = 4;
+/**
+ * client→host: response to a host clipboard-read request. Payload =
+ * [4-byte BE request id][raw result bytes]. Result bytes are the client's
+ * local clipboard content (PNG for image, utf-8 for text/file-urls); an empty
+ * result (payload length 4, no data) means "nothing on the clipboard". Keyed
+ * by id so the right pending read resolves — see `requestClipboard`.
+ */
+export const FRAME_CLIPBOARD = 5;
 const HEADER_BYTES = 5;
-/** Cap on input buffered before `start()` attaches the handler (see `#pendingInput`). */
+/**
+ * Pre-attach input threshold. Input buffered before `start()` attaches the
+ * handler stays in `#pendingInput`; once it crosses this, the socket is paused
+ * so the kernel/TCP holds the rest losslessly (backpressure) instead of the
+ * old silent drop — a large paste racing session init keeps its tail.
+ */
 const MAX_PENDING_INPUT_BYTES = 256 * 1024;
 /** Max frame payload bytes; reject and close socket if a frame header claims more. */
 const MAX_FRAME_BYTES = 8 * 1024 * 1024; // 8 MB
+/**
+ * Larger per-frame cap for clipboard responses only: a full-resolution PNG
+ * screenshot routinely exceeds 8 MB, and the client sends it as one frame.
+ * Still bounded so a hostile/garbled frame can't grow unbounded.
+ */
+const MAX_CLIPBOARD_FRAME_BYTES = 64 * 1024 * 1024; // 64 MB
 
 /** Encode a client→host frame. Used by the thin client. */
 export function encodeFrame(type: number, payload: Buffer): Buffer {
@@ -70,6 +90,11 @@ export class SocketTerminal implements Terminal {
 	 */
 	#pendingInput: string[] = [];
 	#pendingInputBytes = 0;
+	/** True while the socket is paused for pre-attach input backpressure. */
+	#inputPaused = false;
+	#clipboardSeq = 0;
+	/** Pending client clipboard reads, keyed by request id (see `requestClipboard`). */
+	#pendingClipboard = new Map<number, (result: Buffer | null) => void>();
 	#writeQueue: string[] = [];
 	#waitingForDrain = false;
 	#cwd?: string;
@@ -126,7 +151,8 @@ export class SocketTerminal implements Terminal {
 		while (this.#buf.length >= HEADER_BYTES) {
 			const type = this.#buf[0];
 			const len = this.#buf.readUInt32BE(1);
-			if (len > MAX_FRAME_BYTES) {
+			const cap = type === FRAME_CLIPBOARD ? MAX_CLIPBOARD_FRAME_BYTES : MAX_FRAME_BYTES;
+			if (len > cap) {
 				this.#socket.destroy();
 				return;
 			}
@@ -137,12 +163,24 @@ export class SocketTerminal implements Terminal {
 				const data = payload.toString("utf8");
 				if (this.#inputHandler) {
 					this.#inputHandler(data);
-				} else if (this.#pendingInputBytes < MAX_PENDING_INPUT_BYTES) {
-					// ponytail: bounded so a client streaming pre-attach input can't
-					// grow this unbounded; the real window is sub-second, so the cap
-					// never bites in practice — it just caps a stuck/hostile init.
+				} else {
 					this.#pendingInput.push(data);
 					this.#pendingInputBytes += payload.length;
+					// Backpressure instead of dropping: once buffered pre-attach input
+					// crosses the cap, pause the socket so the kernel/TCP holds the rest
+					// losslessly until start() flushes and resumes. Lossless replaces
+					// the old silent truncation of a large paste racing session init.
+					if (this.#pendingInputBytes >= MAX_PENDING_INPUT_BYTES && !this.#inputPaused) {
+						this.#inputPaused = true;
+						this.#socket.pause();
+					}
+				}
+			} else if (type === FRAME_CLIPBOARD && payload.length >= 4) {
+				const id = payload.readUInt32BE(0);
+				const resolve = this.#pendingClipboard.get(id);
+				if (resolve) {
+					this.#pendingClipboard.delete(id);
+					resolve(payload.subarray(4));
 				}
 			} else if (type === FRAME_RESIZE && payload.length >= 8) {
 				this.#cols = Math.max(1, payload.readUInt32BE(0));
@@ -171,6 +209,44 @@ export class SocketTerminal implements Terminal {
 			this.#pendingInputBytes = 0;
 			for (const data of pending) onInput(data);
 		}
+		// Release any backpressure pause: the handler is attached now, so the
+		// kernel-buffered tail flows in and dispatches live.
+		if (this.#inputPaused) {
+			this.#inputPaused = false;
+			this.#socket.resume();
+		}
+	}
+
+	/**
+	 * Ask the connected client to read ITS OWN local OS clipboard and stream the
+	 * bytes back over a {@link FRAME_CLIPBOARD} frame, keyed by request id so the
+	 * right caller resolves. Isolates per session: the daemon HOST's clipboard is
+	 * never touched, so nothing leaks across sessions.
+	 *
+	 * The request goes host→client as a NUL-prefixed JSON control line (`\x00` +
+	 * JSON + `\n`) — same convention as the session/end sentinels; NUL never
+	 * appears in terminal render bytes, so the client can pick it out of the raw
+	 * host→client stream and tell it apart from real output.
+	 *
+	 * Resolves `null` on timeout or when the socket is dead — an old client that
+	 * doesn't understand the request simply never answers, so callers fall back
+	 * to an empty read (today's daemon behavior), never a hang.
+	 */
+	async requestClipboard(kind: ClipboardKind, timeoutMs: number): Promise<Buffer | null> {
+		if (!this.#socket.writable) return null;
+		const id = ++this.#clipboardSeq;
+		const result = new Promise<Buffer | null>(resolve => {
+			const timer = setTimeout(() => {
+				this.#pendingClipboard.delete(id);
+				resolve(null);
+			}, timeoutMs);
+			this.#pendingClipboard.set(id, payload => {
+				clearTimeout(timer);
+				resolve(payload);
+			});
+		});
+		this.write(`\x00${JSON.stringify({ omp: "clipboard-read", kind, id })}\n`);
+		return result;
 	}
 
 	stop(): void {
