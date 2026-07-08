@@ -10,13 +10,18 @@
 // never triggers a respawn — see decideAfterClose() below.
 const net = require("node:net");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, execFile } = require("node:child_process");
 
 const FRAME_INPUT = 1;
 const FRAME_RESIZE = 2;
 const FRAME_CWD = 3;
 const FRAME_RESUME = 4;
+// client→host: reply to a host clipboard-read control line. Payload =
+// [4-byte BE request id][raw result bytes]; just the id when the read failed
+// or the clipboard is empty. See FRAME_CLIPBOARD in socket-terminal.ts.
+const FRAME_CLIPBOARD = 5;
 function frame(type, payload) {
 	const h = Buffer.allocUnsafe(5);
 	h[0] = type;
@@ -137,9 +142,194 @@ function sentinelSplit(held, bytes) {
 	return { out: buf.subarray(0, buf.length - k), held: buf.subarray(buf.length - k) };
 }
 
+// A NUL-prefixed control line longer than this is not a control line — flush it
+// as render bytes instead of holding the stream hostage waiting for a newline.
+const MAX_CONTROL_LINE = 4096;
+
+/**
+ * Generalizes sentinelSplit for VARIABLE-length control lines: the daemon's
+ * clipboard-read request (`\x00{"omp":"clipboard-read",...}\n`) shares the
+ * `\x00{"omp":"` prefix with the end sentinel but diverges after, so the
+ * fixed-sentinel suffix match above can't hold it back. This scans for NUL,
+ * holds from there until the `\n` (across chunk boundaries), then dispatches:
+ * a parsed message `onControl` consumes is stripped from the render output;
+ * a trailing end sentinel is held back for the close handler exactly like
+ * sentinelSplit did; anything else (unparsable, unknown) is flushed verbatim
+ * so an older/different daemon's bytes are never silently dropped.
+ */
+function controlSplit(held, bytes, onControl) {
+	let buf = held.length ? Buffer.concat([held, bytes]) : bytes;
+	const out = [];
+	for (;;) {
+		const nul = buf.indexOf(0);
+		if (nul === -1) {
+			out.push(buf);
+			return { out: Buffer.concat(out), held: Buffer.alloc(0) };
+		}
+		out.push(buf.subarray(0, nul));
+		const rest = buf.subarray(nul);
+		const nl = rest.indexOf(0x0a);
+		if (nl === -1) {
+			if (rest.length > MAX_CONTROL_LINE) {
+				out.push(rest);
+				return { out: Buffer.concat(out), held: Buffer.alloc(0) };
+			}
+			return { out: Buffer.concat(out), held: rest };
+		}
+		const line = rest.subarray(0, nl + 1);
+		let msg;
+		try {
+			msg = JSON.parse(line.subarray(1, nl).toString("utf8"));
+		} catch {
+			msg = undefined;
+		}
+		if (msg && onControl && onControl(msg)) {
+			// consumed (e.g. clipboard-read) — stripped from render output
+		} else if (line.equals(END_SENTINEL_BYTES) && rest.length === nl + 1) {
+			return { out: Buffer.concat(out), held: line };
+		} else {
+			out.push(line);
+		}
+		buf = rest.subarray(nl + 1);
+	}
+}
+
+// --- client-side clipboard reads (host asks, we read OUR OS clipboard) ---
+
+// Images: a full-res PNG screenshot can be tens of MB.
+const CLIP_MAX_BUFFER = 64 * 1024 * 1024;
+const CLIP_TIMEOUT_MS = 2500;
+
+/** Run a command, feed optional stdin, resolve raw stdout Buffer — null on any failure. */
+function runCapture(cmd, args, input) {
+	return new Promise(resolve => {
+		let child;
+		try {
+			child = execFile(
+				cmd,
+				args,
+				{ encoding: "buffer", maxBuffer: CLIP_MAX_BUFFER, timeout: CLIP_TIMEOUT_MS },
+				(err, stdout) => resolve(err ? null : stdout),
+			);
+		} catch {
+			resolve(null);
+			return;
+		}
+		if (input !== undefined && child.stdin) {
+			child.stdin.on("error", () => {});
+			child.stdin.end(input);
+		}
+	});
+}
+
+// Same AppleScript as clipboard.ts's MAC_FILE_URL_SCRIPT (duplicated — no shared
+// module between the two runtimes): POSIX paths of file URLs on the pasteboard,
+// one per line, empty output when there are none.
+const MAC_FILE_URL_SCRIPT = [
+	"on run",
+	'\tset output to ""',
+	"\ttry",
+	"\t\tset theClip to the clipboard as «class furl»",
+	"\t\tif class of theClip is list then",
+	"\t\t\trepeat with anItem in theClip",
+	"\t\t\t\ttry",
+	"\t\t\t\t\tset output to output & POSIX path of anItem & linefeed",
+	"\t\t\t\tend try",
+	"\t\t\tend repeat",
+	"\t\telse",
+	"\t\t\ttry",
+	"\t\t\t\tset output to POSIX path of theClip & linefeed",
+	"\t\t\tend try",
+	"\t\tend if",
+	"\tend try",
+	"\treturn output",
+	"end run",
+].join("\n");
+
+/** macOS clipboard image → PNG bytes via AppleScript's «class PNGf» through a temp file (no pngpaste dependency). */
+async function readMacImage() {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-clip-"));
+	const tmp = path.join(dir, "clip.png");
+	const script = [
+		"try",
+		"\tset pngData to the clipboard as «class PNGf»",
+		`\tset f to open for access POSIX file "${tmp}" with write permission`,
+		"\twrite pngData to f",
+		"\tclose access f",
+		"end try",
+	].join("\n");
+	try {
+		await runCapture("osascript", ["-"], script);
+		return fs.readFileSync(tmp);
+	} catch {
+		return Buffer.alloc(0);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Read this machine's clipboard for the daemon (kinds mirror clipboard.ts's
+ * native readers). Never throws; empty Buffer means "nothing there / failed",
+ * which the daemon maps back to today's empty-clipboard behavior.
+ */
+async function readClipboard(kind) {
+	try {
+		if (process.platform === "darwin") {
+			if (kind === "text") return (await runCapture("pbpaste", [])) || Buffer.alloc(0);
+			if (kind === "image") return await readMacImage();
+			if (kind === "macFileUrls") return (await runCapture("osascript", ["-"], MAC_FILE_URL_SCRIPT)) || Buffer.alloc(0);
+		} else if (process.platform === "linux") {
+			// ponytail: wl-paste then xclip, same order as clipboard.ts; no Windows/WSL
+			// branch — the bench client only runs on mac/linux dev boxes today.
+			if (kind === "text") {
+				return (
+					(await runCapture("wl-paste", ["--type", "text/plain", "--no-newline"])) ||
+					(await runCapture("xclip", ["-selection", "clipboard", "-o"])) ||
+					Buffer.alloc(0)
+				);
+			}
+			if (kind === "image") {
+				return (
+					(await runCapture("wl-paste", ["--type", "image/png"])) ||
+					(await runCapture("xclip", ["-selection", "clipboard", "-t", "image/png", "-o"])) ||
+					Buffer.alloc(0)
+				);
+			}
+		}
+	} catch {
+		// fall through — clipboard reads are best-effort
+	}
+	return Buffer.alloc(0);
+}
+
+/**
+ * Handle one parsed control message from the render stream. Returns true when
+ * the message was a clipboard-read request (so controlSplit strips it); the
+ * reply — [4-byte BE id][result bytes], empty result on failure — goes back as
+ * a FRAME_CLIPBOARD frame. A clipboard failure never crashes the client; the
+ * daemon's timeout covers a reply that never makes it.
+ */
+function handleControl(msg, sock, read = readClipboard) {
+	if (!msg || msg.omp !== "clipboard-read" || !Number.isInteger(msg.id)) return false;
+	read(msg.kind)
+		.catch(() => Buffer.alloc(0))
+		.then(result => {
+			const idBuf = Buffer.allocUnsafe(4);
+			idBuf.writeUInt32BE(msg.id >>> 0, 0);
+			if (!sock.destroyed) sock.write(frame(FRAME_CLIPBOARD, Buffer.concat([idBuf, result])));
+		});
+	return true;
+}
+
 module.exports = {
 	decideAfterClose,
 	sentinelSplit,
+	controlSplit,
+	handleControl,
+	readClipboard,
+	FRAME_CLIPBOARD,
+	frame,
 	isGracefulShutdown,
 	isLockStale,
 	isProcessAlive,
@@ -279,7 +469,10 @@ function main() {
 
 		function emit(bytes) {
 			if (!bytes.length) return;
-			const split = sentinelSplit(held, bytes);
+			// controlSplit strips clipboard-read control lines (answered out of band
+			// via FRAME_CLIPBOARD) and holds back the end sentinel, exactly like
+			// sentinelSplit did for the sentinel alone.
+			const split = controlSplit(held, bytes, msg => handleControl(msg, sock));
 			held = split.held;
 			if (split.out.length) process.stdout.write(split.out);
 		}

@@ -173,6 +173,34 @@ test("requestClipboard round-trips the client's reply, keyed by id", async () =>
 	client.destroy();
 });
 
+test("requestClipboard round-trips through the REAL thin-client code path (controlSplit + handleControl)", async () => {
+	// Drives the actual bench/tui-client.cjs parsing/reply logic against the real
+	// SocketTerminal, with only the OS clipboard read stubbed.
+	const { createRequire } = await import("node:module");
+	const req = createRequire(import.meta.url);
+	const { controlSplit, handleControl } = req("../../../../bench/tui-client.cjs");
+	const { client, terminal } = await setup();
+	const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 9, 8, 7]);
+	let held = Buffer.alloc(0);
+	const rendered: Buffer[] = [];
+	client.on("data", buf => {
+		const split = controlSplit(held, buf as Buffer, (msg: unknown) => handleControl(msg, client, async () => png));
+		held = split.held;
+		if (split.out.length) rendered.push(split.out);
+	});
+
+	terminal.write("render-bytes-"); // interleave real output around the control line
+	const result = await terminal.requestClipboard("image", 2000);
+	terminal.write("-more");
+	await Bun.sleep(30);
+
+	expect(result).not.toBeNull();
+	expect(Buffer.from(result!).equals(png)).toBe(true);
+	// The control line was stripped: the client's terminal saw only render bytes.
+	expect(Buffer.concat(rendered).toString("utf8")).toBe("render-bytes--more");
+	client.destroy();
+});
+
 test("requestClipboard resolves null when the client never answers (old client)", async () => {
 	const { terminal } = await setup();
 	// No client handler -> no FRAME_CLIPBOARD reply -> timeout -> null (callers
