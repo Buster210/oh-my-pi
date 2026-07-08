@@ -213,6 +213,12 @@ export class SocketTerminal implements Terminal {
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.#inputHandler = onInput;
 		this.#resizeHandler = onResize;
+		// Enable bracketed paste on the CLIENT's real terminal (the thin client
+		// dumps host bytes verbatim, so this reaches the tty). Without it the
+		// terminal never wraps pastes in \x1b[200~…\x1b[201~ and a large paste
+		// arrives as bare bytes the editor consumes as keystrokes — every CR
+		// submits. Mirrors ProcessTerminal.start's "\x1b[?2004h".
+		this.write("\x1b[?2004h");
 		// Flush any input that arrived before the handler attached, in order.
 		if (this.#pendingInput.length) {
 			const pending = this.#pendingInput;
@@ -261,6 +267,10 @@ export class SocketTerminal implements Terminal {
 	}
 
 	stop(): void {
+		// Leave the client's terminal clean: disable bracketed paste so a shell
+		// after quit doesn't receive marker-wrapped pastes. Best-effort — write()
+		// already no-ops on a dead socket.
+		this.write("\x1b[?2004l");
 		this.#inputHandler = undefined;
 		this.#resizeHandler = undefined;
 	}

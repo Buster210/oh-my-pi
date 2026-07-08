@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import * as net from "node:net";
+import { BracketedPasteHandler } from "@oh-my-pi/pi-tui/bracketed-paste";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -37,6 +38,60 @@ async function setup(runInScope?: <T>(fn: () => T) => T) {
 	const terminal = new SocketTerminal(host, 80, 24, runInScope);
 	return { host, client, terminal };
 }
+
+test("start() enables bracketed paste on the client terminal; stop() disables it", async () => {
+	// Without \x1b[?2004h reaching the client's real tty, pastes arrive as bare
+	// bytes (no 200~/201~ markers) and the editor consumes them as keystrokes —
+	// every CR submits. The thin client is a verbatim byte pipe, so the daemon
+	// must emit the enable itself, exactly like ProcessTerminal.start does.
+	const { client, terminal } = await setup();
+	const bytes: Buffer[] = [];
+	client.on("data", c => bytes.push(c as Buffer));
+	terminal.start(
+		() => {},
+		() => {},
+	);
+	await Bun.sleep(30);
+	expect(Buffer.concat(bytes).toString("utf8")).toContain("\x1b[?2004h");
+	terminal.stop();
+	await Bun.sleep(30);
+	expect(Buffer.concat(bytes).toString("utf8")).toContain("\x1b[?2004l");
+	client.destroy();
+});
+
+test("a large marker-wrapped paste split into 4KB input frames assembles into one intact paste", async () => {
+	// End-to-end shape of a real big paste over the socket: the client terminal
+	// (bracketed paste enabled) wraps it in 200~/201~, the OS splits it into
+	// small stdin chunks, each framed separately. The editor-side
+	// BracketedPasteHandler must see one paste, zero keystrokes — including the
+	// end marker landing split across frame boundaries.
+	const { client, terminal } = await setup();
+	const handler = new BracketedPasteHandler();
+	const pastes: string[] = [];
+	let keystrokeChunks = 0;
+	terminal.start(
+		data => {
+			const r = handler.process(data);
+			if (r.handled) {
+				if (r.pasteContent !== undefined) pastes.push(r.pasteContent);
+				return;
+			}
+			keystrokeChunks++;
+		},
+		() => {},
+	);
+
+	const content = Array.from({ length: 3000 }, (_, i) => `line ${i} of the pasted blob`).join("\r");
+	const raw = Buffer.from(`\x1b[200~${content}\x1b[201~`, "utf8");
+	for (let i = 0; i < raw.length; i += 4096) {
+		client.write(encodeFrame(FRAME_INPUT, raw.subarray(i, i + 4096)));
+	}
+	await Bun.sleep(150);
+
+	expect(pastes).toEqual([content]);
+	expect(keystrokeChunks).toBe(0);
+	client.destroy();
+});
 
 test("input frames from client reach the terminal's input handler", async () => {
 	const { client, terminal } = await setup();
